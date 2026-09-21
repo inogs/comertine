@@ -18,7 +18,8 @@ dependencies = [
     "distributed (>=2026.3.0,<2027.0.0)",
     "h5netcdf (>=1.8.1,<2.0.0)",
     "h5py (>=3.16.0,<4.0.0)",
-    "matplotlib (>=3.11.2,<4.0.0)"
+    "matplotlib (>=3.11.2,<4.0.0)",
+    "cartopy (>=0.26.0,<0.27.0)"
 ]
 
 [project.scripts]

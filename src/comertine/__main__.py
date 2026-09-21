@@ -1,4 +1,5 @@
 import argparse
+import math
 import multiprocessing as mp
 from pathlib import Path
 
@@ -12,18 +13,18 @@ from comertine.time_resample import extend_ds_in_time, resample_ds_in_time
 URL = "https://mer-staging.exact-lab.it/output/HGT/20260908-MER-MITgcmBFM-HGT-fc-hourly-v01.zarr/"
 
 # The temporal distance from on frame to another
-TIME_INTERVAL = np.timedelta64(150, "s")
+TIME_INTERVAL = np.timedelta64(120, "s")
 
 # For how much time do we run a single particle
 BATCH_TIME_LENGTH = np.timedelta64(8, "h")
 
 # The frequency when we span new particles
-BATCH_EVERY = np.timedelta64(2, "h")
+BATCH_EVERY = np.timedelta64(30, "m")
 
 # How many particles to we spawn at the same time
-BATCH_SIZE = 2000
+BATCH_SIZE = 500
 
-SPEED_FACTOR_INCREASE = 200
+SPEED_FACTOR_INCREASE = 180
 
 
 RANDOM_GENERATOR = np.random.default_rng(0)
@@ -33,9 +34,41 @@ LOCAL_PATH = Path("/scratch/spiani/hgt.zarr")
 OUTPUT_DIR = Path("/dev/shm/particles/")
 PLOT_OUTPUT_DIR = Path("/dev/shm/particles_plot")
 
+# Plot resolution, sized for a fullscreen 4K display
+PLOT_WIDTH_PX = 3840
+PLOT_HEIGHT_PX = 2160
+PLOT_DPI = 100
+
+PLOT_TITLE_FONTSIZE = 28
+PLOT_PARTICLE_SIZE = 15
+PLOT_PARTICLE_COLOR = "white"
+PLOT_PARTICLE_ALPHA = 0.8
+PLOT_GRIDLINE_STEP = 0.1
+PLOT_GRIDLINE_FONTSIZE = 20
+
 # The dataset used by each worker process, set in main() before the
 # multiprocessing pool is spawned so that fork-ed children inherit it.
 _DS: xr.Dataset | None = None
+
+# The particle datasets used by each plot worker process, set in
+# plot_particles() before the multiprocessing pool is spawned so that
+# fork-ed children inherit them.
+_PARTICLE_DATASETS: list[xr.Dataset] | None = None
+
+# The map extent (lon_min, lon_max, lat_min, lat_max) used by each plot
+# worker process, set in plot_particles() before the multiprocessing pool is
+# spawned so that fork-ed children inherit it.
+_PLOT_EXTENT: tuple[float, float, float, float] | None = None
+
+# The (resampled, non-extended) ocean dataset used by each plot worker
+# process to draw the velocity field, set in plot_particles() before the
+# multiprocessing pool is spawned so that fork-ed children inherit it.
+_PLOT_DS: xr.Dataset | None = None
+
+# The upper bound of the speed colorbar (0 is always the lower bound), set
+# in plot_particles() before the multiprocessing pool is spawned so that
+# fork-ed children inherit it.
+_PLOT_SPEED_VMAX: float | None = None
 
 
 def get_borders_and_sizes(v: np.typing.NDArray):
@@ -473,45 +506,149 @@ def compute_particles():
         pool.starmap(run_batch, enumerate(batch_start_times))
 
 
-def plot_particles():
+def plot_frame(index: int, current_time: np.datetime64) -> None:
+    """
+    Plot the particles (inside_domain only) at `current_time`, gathering
+    them from every batch in `_PARTICLE_DATASETS` that covers that time,
+    and save the result to PLOT_OUTPUT_DIR / f"plot{index}.png".
+
+    Runs in a worker process forked from plot_particles():
+    `_PARTICLE_DATASETS` is inherited from the parent rather than passed as
+    an argument.
+    """
+    import cartopy.crs as ccrs
+    import cartopy.feature as cfeature
+    import matplotlib.ticker as mticker
     from matplotlib import pyplot as plt
+
+    latitudes = []
+    longitudes = []
+    alphas = []
+
+    for particles in _PARTICLE_DATASETS:
+        file_times = particles.time.values
+        time_index = int(np.searchsorted(file_times, current_time))
+        if time_index >= len(file_times) or file_times[time_index] != current_time:
+            continue
+
+        frame = particles.isel(time=time_index)
+        inside = frame.inside_domain.values
+        n_particles = int(inside.sum())
+
+        # Particles fade in/out over the first/last quarter of the time
+        # span covered by their own batch file, so a whole batch doesn't
+        # pop in/out abruptly.
+        start_time = file_times[0]
+        end_time = file_times[-1]
+        k = (current_time - start_time) / (end_time - start_time)
+        if k < 0.25:
+            alpha = PLOT_PARTICLE_ALPHA * 4 * k
+        elif k > 0.75:
+            alpha = PLOT_PARTICLE_ALPHA * (1 - k) * 4
+        else:
+            alpha = PLOT_PARTICLE_ALPHA
+
+        latitudes.append(frame.latitude.values[inside])
+        longitudes.append(frame.longitude.values[inside])
+        alphas.append(np.full(n_particles, alpha))
+
+    latitudes = np.concatenate(latitudes) if latitudes else np.empty(0)
+    longitudes = np.concatenate(longitudes) if longitudes else np.empty(0)
+    alphas = np.concatenate(alphas) if alphas else np.empty(0)
+
+    rounded_time = (
+        (current_time + np.timedelta64(30, "m"))
+        .astype("datetime64[h]")
+        .astype("datetime64[s]")
+        .astype(object)
+    )
+
+    ds_time_values = _PLOT_DS.time.values
+    ds_time_index = int(np.searchsorted(ds_time_values, current_time))
+    uo = _PLOT_DS.uo.isel(time=ds_time_index).values
+    vo = _PLOT_DS.vo.isel(time=ds_time_index).values
+    speed = np.sqrt(uo * uo + vo * vo)
+
+    lat_borders, _ = get_borders_and_sizes(_PLOT_DS.latitude.values)
+    lon_borders, _ = get_borders_and_sizes(_PLOT_DS.longitude.values)
+
+    plt.figure(
+        figsize=(PLOT_WIDTH_PX / PLOT_DPI, PLOT_HEIGHT_PX / PLOT_DPI),
+        dpi=PLOT_DPI,
+    )
+    ax = plt.axes(projection=ccrs.PlateCarree())
+    ax.set_extent(_PLOT_EXTENT, crs=ccrs.PlateCarree())
+    mesh = ax.pcolormesh(
+        lon_borders, lat_borders, speed,
+        cmap="plasma", vmin=0, vmax=_PLOT_SPEED_VMAX,
+        transform=ccrs.PlateCarree(), zorder=0,
+    )
+    colorbar = plt.colorbar(mesh, ax=ax)
+    colorbar.set_label("Speed [m/s]", fontsize=PLOT_TITLE_FONTSIZE)
+    colorbar.ax.tick_params(labelsize=PLOT_TITLE_FONTSIZE)
+    ax.add_feature(
+        cfeature.GSHHSFeature(scale="full", edgecolor="black", facecolor="none"),
+        zorder=1,
+    )
+    ax.scatter(
+        longitudes, latitudes, s=PLOT_PARTICLE_SIZE, marker='.', linewidths=0,
+        color=PLOT_PARTICLE_COLOR, alpha=alphas,
+        transform=ccrs.PlateCarree(), zorder=2,
+    )
+    gridlines = ax.gridlines(
+        draw_labels=True, color="lightgray", linestyle="--", zorder=1,
+        xlocs=mticker.MultipleLocator(PLOT_GRIDLINE_STEP),
+        ylocs=mticker.MultipleLocator(PLOT_GRIDLINE_STEP),
+    )
+    gridlines.top_labels = False
+    gridlines.right_labels = False
+    gridlines.xlabel_style = {"size": PLOT_GRIDLINE_FONTSIZE}
+    gridlines.ylabel_style = {"size": PLOT_GRIDLINE_FONTSIZE}
+    ax.set_title(
+        rounded_time.strftime("%Y-%m-%d %H:%M"), fontsize=PLOT_TITLE_FONTSIZE
+    )
+    plt.savefig(PLOT_OUTPUT_DIR / f"plot{index:0>5}.png", dpi=PLOT_DPI)
+    plt.close()
+
+
+def plot_particles():
+    global _PARTICLE_DATASETS, _PLOT_EXTENT, _PLOT_DS, _PLOT_SPEED_VMAX
 
     download_data()
 
     ds = xr.open_zarr(LOCAL_PATH, chunks={})
     ds = resample_ds_in_time(ds, TIME_INTERVAL)
+    # Kept lazy (dask-backed) and shared as-is with the forked workers: the
+    # dataset can be hundreds of GB, so each worker reads only the time
+    # slice it needs from disk instead of the whole thing being loaded into
+    # memory here.
+    _PLOT_DS = ds
     time_values = ds.time.values
 
-    particle_datasets = [
-        xr.open_dataset(f) for f in OUTPUT_DIR.glob("particles_*.nc")
-    ]
+    _PLOT_EXTENT = (
+        float(ds.longitude.min()), float(ds.longitude.max()),
+        float(ds.latitude.min()), float(ds.latitude.max()),
+    )
+
+    # Computed lazily through xarray/dask (a chunked reduction), so this
+    # never materializes the full velocity field in memory at once.
+    speed_max = np.sqrt(ds.uo ** 2 + ds.vo ** 2).max()
+    # _PLOT_SPEED_VMAX = math.ceil(float(speed_max.compute()) / 2) * 2
+    _PLOT_SPEED_VMAX = 1.
+
+    # Loaded eagerly (and the files closed) here in the parent process, so
+    # that forked workers each get plain in-memory datasets via
+    # copy-on-write instead of sharing lazily-opened file handles.
+    particle_datasets = []
+    for f in OUTPUT_DIR.glob("particles_*.nc"):
+        with xr.open_dataset(f) as particles:
+            particle_datasets.append(particles.load())
+    _PARTICLE_DATASETS = particle_datasets
 
     PLOT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    for i, current_time in enumerate(time_values):
-        latitudes = []
-        longitudes = []
-
-        for particles in particle_datasets:
-            file_times = particles.time.values
-            time_index = int(np.searchsorted(file_times, current_time))
-            if time_index >= len(file_times) or file_times[time_index] != current_time:
-                continue
-
-            frame = particles.isel(time=time_index)
-            inside = frame.inside_domain.values
-            latitudes.append(frame.latitude.values[inside])
-            longitudes.append(frame.longitude.values[inside])
-
-        latitudes = np.concatenate(latitudes) if latitudes else np.empty(0)
-        longitudes = np.concatenate(longitudes) if longitudes else np.empty(0)
-
-        plt.scatter(longitudes, latitudes, s=1, marker='.', linewidths=0)
-        plt.savefig(PLOT_OUTPUT_DIR / f"plot{i}.png")
-        plt.close()
-
-    for particles in particle_datasets:
-        particles.close()
+    with mp.get_context("fork").Pool() as pool:
+        pool.starmap(plot_frame, enumerate(time_values))
 
 
 def main():
