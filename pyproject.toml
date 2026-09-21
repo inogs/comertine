@@ -1,0 +1,34 @@
+[project]
+name = "comertine"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "Stefano Piani",email = "spiani@ogs.it"}
+]
+readme = "README.md"
+requires-python = ">=3.12,<4.0"
+dependencies = [
+    "numpy (>=2.0.0,<3.0.0)",
+    "xarray (>=2026.2.0,<2027.0.0)",
+    "zarr (>=3.1.5,<4.0.0)",
+    "fsspec (>=2026.2.0,<2027.0.0)",
+    "aiohttp (>=3.13.3,<4.0.0)",
+    "requests (>=2.32.5,<3.0.0)",
+    "dask (>=2026.3.0,<2027.0.0)",
+    "distributed (>=2026.3.0,<2027.0.0)",
+    "h5netcdf (>=1.8.1,<2.0.0)",
+    "h5py (>=3.16.0,<4.0.0)",
+    "matplotlib (>=3.11.2,<4.0.0)"
+]
+
+[project.scripts]
+comertine = "comertine.__main__:main"
+
+
+[tool.poetry]
+packages = [{ include = "comertine", from = "src" }]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
