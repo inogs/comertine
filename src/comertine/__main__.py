@@ -46,6 +46,20 @@ PLOT_PARTICLE_ALPHA = 0.8
 PLOT_GRIDLINE_STEP = 0.1
 PLOT_GRIDLINE_FONTSIZE = 20
 
+# Number of past positions (current one included) shown as a trail behind
+# each particle. Truncated near the start of a particle's own batch file,
+# where fewer past positions are known.
+PLOT_TRAIL_LENGTH = 8
+# Per-segment weight of the trail, ordered from the newest (closest to the
+# current position) to the oldest. Must have PLOT_TRAIL_LENGTH - 1 entries.
+PLOT_TRAIL_SEGMENT_WEIGHTS = (1.0, 0.8, 0.66, 0.4, 0.33, 0.2, 0.1)
+# How many frames after leaving the domain a particle's trail keeps fading
+# out before disappearing entirely (its position is frozen once it exits,
+# so no new segments are added during this window).
+PLOT_TRAIL_FADE_OUT_FRAMES = 2
+PLOT_TRAIL_LINEWIDTH = 2.0
+PLOT_TRAIL_ZORDER = 1.5
+
 # The dataset used by each worker process, set in main() before the
 # multiprocessing pool is spawned so that fork-ed children inherit it.
 _DS: xr.Dataset | None = None
@@ -520,10 +534,16 @@ def plot_frame(index: int, current_time: np.datetime64) -> None:
     import cartopy.feature as cfeature
     import matplotlib.ticker as mticker
     from matplotlib import pyplot as plt
+    from matplotlib.collections import LineCollection
+    from matplotlib.colors import to_rgba
+
+    particle_rgb = to_rgba(PLOT_PARTICLE_COLOR)[:3]
 
     latitudes = []
     longitudes = []
     alphas = []
+    trail_segments = []
+    trail_colors = []
 
     for particles in _PARTICLE_DATASETS:
         file_times = particles.time.values
@@ -531,26 +551,90 @@ def plot_frame(index: int, current_time: np.datetime64) -> None:
         if time_index >= len(file_times) or file_times[time_index] != current_time:
             continue
 
+        start_time = file_times[0]
+        end_time = file_times[-1]
+
+        def batch_fade_alpha(t):
+            # Particles fade in/out over the first/last quarter of the time
+            # span covered by their own batch file, so a whole batch doesn't
+            # pop in/out abruptly.
+            k = (t - start_time) / (end_time - start_time)
+            if k < 0.25:
+                return PLOT_PARTICLE_ALPHA * 4 * k
+            if k > 0.75:
+                return PLOT_PARTICLE_ALPHA * (1 - k) * 4
+            return PLOT_PARTICLE_ALPHA
+
         frame = particles.isel(time=time_index)
         inside = frame.inside_domain.values
         n_particles = int(inside.sum())
 
-        # Particles fade in/out over the first/last quarter of the time
-        # span covered by their own batch file, so a whole batch doesn't
-        # pop in/out abruptly.
-        start_time = file_times[0]
-        end_time = file_times[-1]
-        k = (current_time - start_time) / (end_time - start_time)
-        if k < 0.25:
-            alpha = PLOT_PARTICLE_ALPHA * 4 * k
-        elif k > 0.75:
-            alpha = PLOT_PARTICLE_ALPHA * (1 - k) * 4
-        else:
-            alpha = PLOT_PARTICLE_ALPHA
-
         latitudes.append(frame.latitude.values[inside])
         longitudes.append(frame.longitude.values[inside])
-        alphas.append(np.full(n_particles, alpha))
+        alphas.append(np.full(n_particles, batch_fade_alpha(current_time)))
+
+        # --- trail ---
+        window_start = max(0, time_index - PLOT_TRAIL_LENGTH + 1)
+        window = particles.isel(time=slice(window_start, time_index + 1))
+        window_lat = window.latitude.values
+        window_lon = window.longitude.values
+        window_inside = window.inside_domain.values
+        n_window = window_lat.shape[0]
+        if n_window < 2:
+            continue
+
+        # For each particle, how many frames back (from the current one) it
+        # was last inside the domain: 0 means still active, 1 means it just
+        # left, etc. Particles not found inside the domain anywhere in the
+        # window left more than PLOT_TRAIL_LENGTH frames ago.
+        reversed_inside = window_inside[::-1, :]
+        has_any_true = reversed_inside.any(axis=0)
+        frames_since_exit = np.argmax(reversed_inside, axis=0)
+
+        draw_mask = has_any_true & (frames_since_exit <= PLOT_TRAIL_FADE_OUT_FRAMES)
+        if not np.any(draw_mask):
+            continue
+
+        exit_fade = np.where(
+            frames_since_exit == 0,
+            1.0,
+            np.clip(
+                1.0 - frames_since_exit / (PLOT_TRAIL_FADE_OUT_FRAMES + 1), 0.0, 1.0
+            ),
+        )
+
+        drawn = np.nonzero(draw_mask)[0]
+
+        # (n_window, n_drawn, 2) -> (n_drawn, n_window, 2)
+        points = np.stack(
+            [window_lon[:, drawn], window_lat[:, drawn]], axis=-1
+        ).transpose(1, 0, 2)
+        segments = np.stack([points[:, :-1, :], points[:, 1:, :]], axis=2)
+
+        n_segments = n_window - 1
+        # Segment recency, counted from the current position backwards: 0 is
+        # the newest segment (closest to "now"), which gets the highest
+        # weight.
+        segment_distance = n_segments - 1 - np.arange(n_segments)
+        segment_weights = np.array(
+            [PLOT_TRAIL_SEGMENT_WEIGHTS[d] for d in segment_distance]
+        )
+        window_times = file_times[window_start:time_index + 1]
+        batch_alpha_per_step = np.array(
+            [batch_fade_alpha(t) for t in window_times]
+        )
+
+        segment_alpha = (
+            batch_alpha_per_step[1:][None, :]
+            * segment_weights[None, :]
+            * exit_fade[drawn][:, None]
+        )
+
+        trail_segments.append(segments.reshape(-1, 2, 2))
+        segment_rgba = np.empty((segment_alpha.size, 4))
+        segment_rgba[:, :3] = particle_rgb
+        segment_rgba[:, 3] = segment_alpha.reshape(-1)
+        trail_colors.append(segment_rgba)
 
     latitudes = np.concatenate(latitudes) if latitudes else np.empty(0)
     longitudes = np.concatenate(longitudes) if longitudes else np.empty(0)
@@ -590,6 +674,14 @@ def plot_frame(index: int, current_time: np.datetime64) -> None:
         cfeature.GSHHSFeature(scale="full", edgecolor="black", facecolor="none"),
         zorder=1,
     )
+    if trail_segments:
+        trail_collection = LineCollection(
+            np.concatenate(trail_segments, axis=0),
+            colors=np.concatenate(trail_colors, axis=0),
+            linewidths=PLOT_TRAIL_LINEWIDTH,
+            transform=ccrs.PlateCarree(), zorder=PLOT_TRAIL_ZORDER,
+        )
+        ax.add_collection(trail_collection)
     ax.scatter(
         longitudes, latitudes, s=PLOT_PARTICLE_SIZE, marker='.', linewidths=0,
         color=PLOT_PARTICLE_COLOR, alpha=alphas,
