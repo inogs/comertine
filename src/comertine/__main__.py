@@ -1,5 +1,4 @@
 import argparse
-import math
 import multiprocessing as mp
 from pathlib import Path
 
@@ -15,7 +14,7 @@ from comertine.domains import Simulation
 URL = "https://mer-model-bgc.ogs.it/output/${DOMAIN}/${DATE}-MER-MITgcmBFM-${DOMAIN}-fc-${FREQUENCY}-v01.zarr"
 LOCAL_PATH = "/dev/shm/${DOMAIN}-${DATE}.zarr"
 
-TITLE = "${DOMAIN} - Surface water currents - ${TIME}"
+TITLE = "${DOMAIN} - ${VARNAME} - ${TIME}"
 
 # The temporal distance from on frame to another
 TIME_INTERVAL = np.timedelta64(120, "s")
@@ -38,8 +37,6 @@ REGIONAL_SPEEDUP_FACTOR = 7.5
 VISUAL_SPEEDUP_FACTOR = None
 
 RANDOM_GENERATOR = np.random.default_rng(0)
-
-PLOT_OUTPUT_DIR = Path("/dev/shm/particles_plot")
 
 # Copernicus DEM GLO-30 tile covering the whole ocean model domain (a
 # single 1x1 degree tile is enough, since the domain is tiny). Public,
@@ -71,9 +68,12 @@ PLOT_GRIDLINE_STEP = None
 
 PLOT_GRIDLINE_FONTSIZE = 20
 
-# Colormap used to draw the current speed field.
-# PLOT_SPEED_CMAP = "plasma"
-PLOT_SPEED_CMAP = "viridis"
+# Colorbar label for each supported --background-variable choice.
+PLOT_BACKGROUND_LABELS = {
+    "speed": "Speed [m/s]",
+    "thetao": "Temperature [°C]",
+    "so": "Salinity [PSU]",
+}
 
 # Name of the cartopy.crs class used to draw the map axes (resolved lazily
 # in plot_frame, where cartopy is imported). Data coordinates stay in plain
@@ -122,10 +122,19 @@ _PLOT_EXTENT: tuple[float, float, float, float] | None = None
 # multiprocessing pool is spawned so that fork-ed children inherit it.
 _PLOT_DS: xr.Dataset | None = None
 
-# The upper bound of the speed colorbar (0 is always the lower bound), set
-# in plot_particles() before the multiprocessing pool is spawned so that
+# The variable drawn as the background color field: "speed" (computed from
+# uo/vo) or a raw dataset variable such as "thetao"/"so". Set in
+# plot_particles() before the multiprocessing pool is spawned so that
 # fork-ed children inherit it.
-_PLOT_SPEED_VMAX: float | None = 0.6
+_PLOT_BACKGROUND_VARIABLE: str | None = None
+
+# The lower/upper bounds of the background field's colorbar, set in
+# plot_particles() before the multiprocessing pool is spawned so that
+# fork-ed children inherit them. When not given on the command line,
+# computed from the dataset as the 5th/95th percentile of the background
+# field's values, respectively.
+_PLOT_SPEED_VMIN: float | None = None
+_PLOT_SPEED_VMAX: float | None = None
 
 # The precomputed land image (either a grayscale hillshade or an
 # already-colored hypsometric-tint hillshade) drawn under the ocean
@@ -140,6 +149,14 @@ _PLOT_HILLSHADE: tuple[np.typing.NDArray, np.typing.NDArray, np.typing.NDArray, 
 # Earth coastlines at 10m/50m resolution). Set in plot_particles() before
 # the multiprocessing pool is spawned so that fork-ed children inherit it.
 _PLOT_COASTLINE: str = "GSHHFS"
+
+# Name of the colormap used to draw the background field, as a plain
+# matplotlib colormap name (e.g. "viridis") or, prefixed with "cmo:", the
+# name of a cmocean colormap (e.g. "cmo:thermal"). Turned into an actual
+# Colormap object by _resolve_colormap() in each plot worker. Set in
+# plot_particles() before the multiprocessing pool is spawned so that
+# fork-ed children inherit it.
+PLOT_BACKGROUND_CMAP: str = "viridis"
 
 
 def get_borders_and_sizes(v: np.typing.NDArray):
@@ -703,14 +720,63 @@ def compute_particles(domain: Domain, date: np.datetime64, output_dir: Path, sho
     simulation_file.write_text(simulation_json, encoding="utf-8")
 
 
-def plot_frame(index: int, current_time: np.datetime64, title: str) -> None:
+def _select_background_field(ds: xr.Dataset, variable: str) -> xr.DataArray:
+    """
+    Select the DataArray to draw as the background color field.
+
+    Returns the speed magnitude computed from uo/vo when `variable` is
+    "speed", or the raw dataset variable otherwise (e.g. "thetao", "so").
+    """
+    if variable == "speed":
+        return np.sqrt(ds.uo ** 2 + ds.vo ** 2)
+    return ds[variable]
+
+
+def _get_background_variable_name(ds: xr.Dataset, variable: str) -> str:
+    """
+    Resolve the ${VARNAME} placeholder in TITLE for the given background
+    variable.
+
+    Fixed to "Sea water currents" for "speed" (which is computed from
+    uo/vo and so has no long_name of its own); otherwise the raw dataset
+    variable's "long_name" attribute. Raises a ValueError if that variable
+    has no "long_name" attribute.
+    """
+    if variable == "speed":
+        return "Sea water currents"
+
+    long_name = ds[variable].attrs.get("long_name")
+    if long_name is None:
+        error_msg = f"Variable '{variable}' has no 'long_name' attribute"
+        raise ValueError(error_msg)
+    return long_name
+
+
+def _resolve_colormap(name: str):
+    """
+    Resolve a --background-cmap string into an actual matplotlib Colormap.
+
+    A "cmo:" prefix selects a cmocean colormap by name (e.g.
+    "cmo:thermal"); otherwise `name` is looked up among matplotlib's
+    built-in colormaps.
+    """
+    if name.startswith("cmo:"):
+        import cmocean
+        return cmocean.cm.cmap_d[name.removeprefix("cmo:")]
+
+    from matplotlib import colormaps
+    return colormaps[name]
+
+
+def plot_frame(index: int, current_time: np.datetime64, title: str, output_dir: Path) -> None:
     """
     Plot the particles (inside_domain only) at `current_time`, gathering
     them from every batch in `_PARTICLE_DATASETS` that covers that time,
-    and save the result to PLOT_OUTPUT_DIR / f"plot{index}.png".
+    and save the result to output_dir / f"plot{index}.png".
 
-    `title` is the fully resolved plot title for this frame, computed by
-    the caller.
+    `title` is the fully resolved plot title for this frame, and
+    `output_dir` the directory to save it into; both computed by the
+    caller.
 
     Runs in a worker process forked from plot_particles():
     `_PARTICLE_DATASETS` is inherited from the parent rather than passed as
@@ -832,10 +898,7 @@ def plot_frame(index: int, current_time: np.datetime64, title: str) -> None:
     ds_time_values = _PLOT_DS.time.values
     ds_time_index = int(np.searchsorted(ds_time_values, current_time))
 
-    plot_ds = _PLOT_DS.copy(deep=False)
-    uo = plot_ds.uo
-    vo = plot_ds.vo
-    plot_ds["speed"] = np.sqrt(uo * uo + vo * vo)
+    background_field = _select_background_field(_PLOT_DS, _PLOT_BACKGROUND_VARIABLE)
 
     lat_borders, _ = get_borders_and_sizes(_PLOT_DS.latitude.values)
     lon_borders, _ = get_borders_and_sizes(_PLOT_DS.longitude.values)
@@ -874,14 +937,15 @@ def plot_frame(index: int, current_time: np.datetime64, title: str) -> None:
             transform=ccrs.PlateCarree(), zorder=PLOT_HILLSHADE_ZORDER,
         )
 
-    data = plot_ds["speed"].isel(time=ds_time_index).values
+    data = background_field.isel(time=ds_time_index).values
+    background_cmap = _resolve_colormap(PLOT_BACKGROUND_CMAP)
     mesh = ax.pcolormesh(
         lon_borders, lat_borders, data,
-        cmap=PLOT_SPEED_CMAP, vmin=0, vmax=_PLOT_SPEED_VMAX,
+        cmap=background_cmap, vmin=_PLOT_SPEED_VMIN, vmax=_PLOT_SPEED_VMAX,
         transform=ccrs.PlateCarree(), zorder=0,
     )
     colorbar = plt.colorbar(mesh, ax=ax)
-    colorbar.set_label("Speed [m/s]", fontsize=PLOT_TITLE_FONTSIZE)
+    colorbar.set_label(PLOT_BACKGROUND_LABELS[_PLOT_BACKGROUND_VARIABLE], fontsize=PLOT_TITLE_FONTSIZE)
     colorbar.ax.tick_params(labelsize=PLOT_TITLE_FONTSIZE)
     if _PLOT_COASTLINE == "GSHHFS":
         ax.add_feature(
@@ -916,30 +980,41 @@ def plot_frame(index: int, current_time: np.datetime64, title: str) -> None:
     gridlines.xlabel_style = {"size": PLOT_GRIDLINE_FONTSIZE}
     gridlines.ylabel_style = {"size": PLOT_GRIDLINE_FONTSIZE}
     ax.set_title(title, fontsize=PLOT_TITLE_FONTSIZE)
-    plt.savefig(PLOT_OUTPUT_DIR / f"plot{index:0>5}.png", dpi=PLOT_DPI)
+    plt.savefig(output_dir / f"plot{index:0>5}.png", dpi=PLOT_DPI)
     plt.close()
 
 
-def _plot_frame_star(args: tuple[int, np.datetime64, str]) -> None:
+def _plot_frame_star(args: tuple[int, np.datetime64, str, Path]) -> None:
     return plot_frame(*args)
 
 
 def plot_particles(
         input_dir: Path,
+        output_dir: str = "/dev/shm/particles_plot",
         land_filler: str = "none",
         coastline: str = "GSHHFS",
+        background_variable: str = "speed",
+        background_cmap: str = "viridis",
+        vmin: float | None = None,
+        vmax: float | None = None,
         show_progress: bool = True,
 ):
-    global _PARTICLE_DATASETS, _PLOT_EXTENT, _PLOT_DS, _PLOT_SPEED_VMAX, _PLOT_HILLSHADE, _PLOT_COASTLINE
-    global PLOT_GRIDLINE_STEP
+    global _PARTICLE_DATASETS, _PLOT_EXTENT, _PLOT_DS, _PLOT_BACKGROUND_VARIABLE, _PLOT_SPEED_VMIN, _PLOT_SPEED_VMAX, _PLOT_HILLSHADE, _PLOT_COASTLINE
+    global PLOT_GRIDLINE_STEP, PLOT_BACKGROUND_CMAP
 
     _PLOT_COASTLINE = coastline
+    _PLOT_BACKGROUND_VARIABLE = background_variable
+    PLOT_BACKGROUND_CMAP = background_cmap
+    _PLOT_SPEED_VMIN = vmin
+    _PLOT_SPEED_VMAX = vmax
 
     simulation_file = input_dir / "simulation.json"
     simulation = Simulation.model_validate_json(simulation_file.read_text())
 
     domain = simulation.domain
     date = np.datetime64(simulation.date, 's')
+
+    output_dir_path = Path(_replace_string(output_dir, domain=domain, date=date))
 
     local_path = _get_local_path(domain=domain, date=date)
 
@@ -970,11 +1045,15 @@ def plot_particles(
     elif land_filler == "colored-hillshade":
         _PLOT_HILLSHADE = compute_colored_hillshade(_PLOT_EXTENT)
 
-    # Computed lazily through xarray/dask (a chunked reduction), so this
-    # never materializes the full velocity field in memory at once.
-    speed_max = np.sqrt(ds.uo ** 2 + ds.vo ** 2).max()
-    if _PLOT_SPEED_VMAX is None:
-        _PLOT_SPEED_VMAX = math.ceil(float(speed_max.compute()) * 10) / 10.
+    if _PLOT_SPEED_VMIN is None or _PLOT_SPEED_VMAX is None:
+        # Computed lazily through xarray/dask (a chunked reduction), so this
+        # never materializes the full background field in memory at once.
+        background_field = _select_background_field(ds, _PLOT_BACKGROUND_VARIABLE)
+        field_p05, field_p95 = background_field.quantile([0.05, 0.95]).compute().values
+        if _PLOT_SPEED_VMIN is None:
+            _PLOT_SPEED_VMIN = float(field_p05)
+        if _PLOT_SPEED_VMAX is None:
+            _PLOT_SPEED_VMAX = float(field_p95)
 
     # Loaded eagerly (and the files closed) here in the parent process, so
     # that forked workers each get plain in-memory datasets via
@@ -985,9 +1064,11 @@ def plot_particles(
             particle_datasets.append(particles.load())
     _PARTICLE_DATASETS = particle_datasets
 
-    PLOT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    output_dir_path.mkdir(parents=True, exist_ok=True)
 
+    varname = _get_background_variable_name(ds, _PLOT_BACKGROUND_VARIABLE)
     title_template = _replace_string(TITLE, domain=domain, date=date)
+    title_template = title_template.replace("${VARNAME}", varname)
     frames = []
     for i, t in enumerate(time_values):
         rounded_time = (
@@ -997,7 +1078,7 @@ def plot_particles(
             .astype(object)
         )
         title = title_template.replace("${TIME}", rounded_time.strftime("%Y-%m-%d %H:%M"))
-        frames.append((i, t, title))
+        frames.append((i, t, title, output_dir_path))
     with mp.get_context("fork").Pool() as pool, tqdm(
         total=len(frames), desc="Plotting frames", disable=not show_progress
     ) as pbar:
@@ -1053,9 +1134,38 @@ def main():
         default="GSHHFS",
     )
     plot_parser.add_argument(
+        "--background-variable", choices=["speed", "thetao", "so"],
+        default="speed",
+        help="Which field to draw as the background color field: current "
+             "speed (default), temperature (thetao) or salinity (so).",
+    )
+    plot_parser.add_argument(
+        "--background-cmap", type=str, default="viridis",
+        help="Colormap used to draw the background field: a matplotlib "
+             "colormap name (default: viridis), or a cmocean colormap "
+             "name prefixed with 'cmo:' (e.g. cmo:thermal).",
+    )
+    plot_parser.add_argument(
+        "--vmin", type=float, default=None,
+        help="Lower bound of the background field's colorbar (default: "
+             "the dataset's 5th percentile of that field's values).",
+    )
+    plot_parser.add_argument(
+        "--vmax", type=float, default=None,
+        help="Upper bound of the background field's colorbar (default: "
+             "the dataset's 95th percentile of that field's values).",
+    )
+    plot_parser.add_argument(
         "-i", "--input-dir", type=Path, required=True,
         help="The directory where the trajectories of the particles are "
              "stored.",
+    )
+    plot_parser.add_argument(
+        "-o", "--output-dir", type=str, default="/dev/shm/particles_plot",
+        help="The directory where the frame PNGs will be stored (default: "
+             "/dev/shm/particles_plot). If a flag like ${DOMAIN} or "
+             "${DATE} is inside the path, it will be replaced with the "
+             "correct value.",
     )
 
     args = parser.parse_args()
@@ -1087,7 +1197,11 @@ def main():
     elif args.action == "plot":
         plot_particles(
             input_dir=args.input_dir,
+            output_dir=args.output_dir,
             land_filler=args.land_filler, coastline=args.coastline,
+            background_variable=args.background_variable,
+            background_cmap=args.background_cmap,
+            vmin=args.vmin, vmax=args.vmax,
             show_progress=args.progress,
         )
     else:

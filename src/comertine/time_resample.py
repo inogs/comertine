@@ -83,11 +83,20 @@ def resample_ds_in_time(ds, new_time_resolution: np.timedelta64):
         new_d_var = xr.DataArray(
             new_data,
             dims=ds[d_var].dims,
-            coords=previous_coords
+            coords=previous_coords,
+            attrs=ds[d_var].attrs,
         )
         new_vars[d_var] = new_d_var
 
-    new_ds = xr.Dataset(new_vars)
+    new_ds = xr.Dataset(new_vars, attrs=ds.attrs)
+
+    # Coordinates not tied to any data_var's dims (e.g. scalar/auxiliary
+    # coordinates) are otherwise silently dropped by rebuilding the
+    # Dataset from new_vars alone.
+    for coord_name in ds.coords:
+        if coord_name != "time" and coord_name not in new_ds.coords:
+            new_ds = new_ds.assign_coords({coord_name: ds.coords[coord_name]})
+
     return new_ds
 
 
