@@ -5,34 +5,55 @@ from pathlib import Path
 
 import numpy as np
 import xarray as xr
+from tqdm import tqdm
 
 from comertine.time_resample import extend_ds_in_time, resample_ds_in_time
+from comertine.domains import Domain
+from comertine.domains import DOMAINS
+from comertine.domains import Simulation
 
+URL = "https://mer-model-bgc.ogs.it/output/${DOMAIN}/${DATE}-MER-MITgcmBFM-${DOMAIN}-fc-${FREQUENCY}-v01.zarr"
+LOCAL_PATH = "/dev/shm/${DOMAIN}-${DATE}.zarr"
 
-# URL = "https://mer-staging.exact-lab.it/output/SIC/20260321-MER-MITgcmBFM-SIC-fc-hourly-v01.zarr"
-URL = "https://mer-staging.exact-lab.it/output/HGT/20260908-MER-MITgcmBFM-HGT-fc-hourly-v01.zarr/"
+TITLE = "${DOMAIN} - Surface water currents - ${TIME}"
 
 # The temporal distance from on frame to another
 TIME_INTERVAL = np.timedelta64(120, "s")
+TIME_INTERVAL_SECONDS = TIME_INTERVAL / np.timedelta64(1, "s")
 
-# For how much time do we run a single particle
+# For how much time do we run a single particle?
 BATCH_TIME_LENGTH = np.timedelta64(8, "h")
 
 # The frequency when we span new particles
 BATCH_EVERY = np.timedelta64(30, "m")
 
-# How many particles to we spawn at the same time
+# How many particles to we spawn at the same time?
 BATCH_SIZE = 500
 
-SPEED_FACTOR_INCREASE = 180
-
+# Dimensionless multipliers applied on top of the real TIME_INTERVAL to
+# make particle motion visible on the animation (real advection over 120s
+# would barely move the particles from one frame to the next).
+VHR_SPEEDUP_FACTOR = 1.5
+REGIONAL_SPEEDUP_FACTOR = 7.5
+VISUAL_SPEEDUP_FACTOR = None
 
 RANDOM_GENERATOR = np.random.default_rng(0)
 
-
-LOCAL_PATH = Path("/scratch/spiani/hgt.zarr")
-OUTPUT_DIR = Path("/dev/shm/particles/")
 PLOT_OUTPUT_DIR = Path("/dev/shm/particles_plot")
+
+# Copernicus DEM GLO-30 tile covering the whole ocean model domain (a
+# single 1x1 degree tile is enough, since the domain is tiny). Public,
+# no-auth AWS Open Data bucket.
+DEM_URL = (
+    "https://copernicus-dem-30m.s3.amazonaws.com/"
+    "Copernicus_DSM_COG_10_N45_00_E013_00_DEM/"
+    "Copernicus_DSM_COG_10_N45_00_E013_00_DEM.tif"
+)
+DEM_LOCAL_PATH = Path("/scratch/spiani/dem_n45_e013.tif")
+
+PLOT_HILLSHADE_AZIMUTH = 315
+PLOT_HILLSHADE_ALTITUDE = 45
+PLOT_HILLSHADE_ZORDER = -1
 
 # Plot resolution, sized for a fullscreen 4K display
 PLOT_WIDTH_PX = 3840
@@ -43,16 +64,38 @@ PLOT_TITLE_FONTSIZE = 28
 PLOT_PARTICLE_SIZE = 15
 PLOT_PARTICLE_COLOR = "white"
 PLOT_PARTICLE_ALPHA = 0.8
-PLOT_GRIDLINE_STEP = 0.1
+
+REGIONAL_PLOT_GRIDLINE_STEP = 0.5
+VHR_PLOT_GRIDLINE_STEP = 0.1
+PLOT_GRIDLINE_STEP = None
+
 PLOT_GRIDLINE_FONTSIZE = 20
+
+# Colormap used to draw the current speed field.
+# PLOT_SPEED_CMAP = "plasma"
+PLOT_SPEED_CMAP = "viridis"
+
+# Name of the cartopy.crs class used to draw the map axes (resolved lazily
+# in plot_frame, where cartopy is imported). Data coordinates stay in plain
+# lon/lat (ccrs.PlateCarree()) regardless of this setting.
+# PLOT_PROJECTION = "PlateCarree"
+# PLOT_PROJECTION = "Mercator"
+PLOT_PROJECTION = "LambertConformal"
+# PLOT_PROJECTION = "NearsidePerspective"
+
+# Satellite altitude (in meters) used when PLOT_PROJECTION is
+# "NearsidePerspective". Lower than the cartopy default (geostationary,
+# ~35.8e6 m) so the globe's curvature actually reads on a small domain.
+PLOT_NEARSIDE_SATELLITE_HEIGHT = 2_000_000
 
 # Number of past positions (current one included) shown as a trail behind
 # each particle. Truncated near the start of a particle's own batch file,
 # where fewer past positions are known.
-PLOT_TRAIL_LENGTH = 8
+PLOT_TRAIL_LENGTH = 24
 # Per-segment weight of the trail, ordered from the newest (closest to the
 # current position) to the oldest. Must have PLOT_TRAIL_LENGTH - 1 entries.
-PLOT_TRAIL_SEGMENT_WEIGHTS = (1.0, 0.8, 0.66, 0.4, 0.33, 0.2, 0.1)
+# PLOT_TRAIL_SEGMENT_WEIGHTS = (1.0, 0.8, 0.66, 0.4, 0.33, 0.2, 0.1)
+PLOT_TRAIL_SEGMENT_WEIGHTS = np.linspace(1, 0, PLOT_TRAIL_LENGTH - 1) ** 2
 # How many frames after leaving the domain a particle's trail keeps fading
 # out before disappearing entirely (its position is frozen once it exits,
 # so no new segments are added during this window).
@@ -82,7 +125,21 @@ _PLOT_DS: xr.Dataset | None = None
 # The upper bound of the speed colorbar (0 is always the lower bound), set
 # in plot_particles() before the multiprocessing pool is spawned so that
 # fork-ed children inherit it.
-_PLOT_SPEED_VMAX: float | None = None
+_PLOT_SPEED_VMAX: float | None = 0.6
+
+# The precomputed land image (either a grayscale hillshade or an
+# already-colored hypsometric-tint hillshade) drawn under the ocean
+# velocity field (whose NaN-over-land cells let it show through), as
+# (image, lon, lat, cmap) - cmap is None when image is already RGBA. Set in
+# plot_particles() before the multiprocessing pool is spawned so that
+# fork-ed children inherit it; None when --land-filler is "none".
+_PLOT_HILLSHADE: tuple[np.typing.NDArray, np.typing.NDArray, np.typing.NDArray, str | None] | None = None
+
+# Which coastline to draw: "none" (skip it), "GSHHFS" (full-resolution
+# cfeature.GSHHSFeature), "cartopy10m"/"cartopy50m" (cartopy's own Natural
+# Earth coastlines at 10m/50m resolution). Set in plot_particles() before
+# the multiprocessing pool is spawned so that fork-ed children inherit it.
+_PLOT_COASTLINE: str = "GSHHFS"
 
 
 def get_borders_and_sizes(v: np.typing.NDArray):
@@ -91,7 +148,7 @@ def get_borders_and_sizes(v: np.typing.NDArray):
 
     Given a 1D array that contains the position of the centers of some cells,
     it computes the position of the boundaries between the two cells supposing
-    that the boundary are exactly in the middle between the two centers.
+    that the boundaries are exactly in the middle between the two centers.
 
     Args:
         v: the array with the position of the centers
@@ -109,32 +166,39 @@ def get_borders_and_sizes(v: np.typing.NDArray):
     return v_borders, v_borders[1:] - v_borders[:-1]
 
 
-def compute_new_coords(current_lat:np.ndarray, current_lon:np.ndarray, x_movement:np.ndarray, y_movement:np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def compute_new_coords(current_lat:np.ndarray, current_lon:np.ndarray, x_velocity:np.ndarray, y_velocity:np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """
     Compute the new coordinates of the particles.
-    
-    This function adds to the current coordinates the movement of the particles,
-    taking care of converting the movements from meters to degrees.
+
+    Advects the current coordinates by the given velocity field over one
+    simulation time step (TIME_INTERVAL_SECONDS), scaled by
+    VISUAL_SPEEDUP_FACTOR so the motion is actually visible on the
+    animation, then converts the resulting displacement from meters to
+    degrees.
 
     Args:
         current_lat: The current latitude of the particle (in degrees).
         current_lon: The current longitude of the particle (in degrees).
-        x_movement: The movement in the x direction (in metres).
-        y_movement: The movement in the y direction (in metres).
+        x_velocity: The velocity in the x direction (in m/s).
+        y_velocity: The velocity in the y direction (in m/s).
     """
     # Earth radius in meters
-    EARTH_RADIUS = 6371000.0
+    earth_radius = 6371000.0
+
+    dt_seconds = TIME_INTERVAL_SECONDS * VISUAL_SPEEDUP_FACTOR
+    y_movement = y_velocity * dt_seconds
+    x_movement = x_velocity * dt_seconds
 
     # Convert y_movement (north-south) from meters to degrees
-    lat_change = np.degrees(y_movement / EARTH_RADIUS)
+    lat_change = np.degrees(y_movement / earth_radius)
 
     # Convert x_movement (east-west) from meters to degrees
     # Account for convergence of meridians at different latitudes
     lon_change = np.degrees(
-        x_movement / (EARTH_RADIUS * np.cos(np.radians(current_lat))))
+        x_movement / (earth_radius * np.cos(np.radians(current_lat))))
 
-    new_lat = current_lat + SPEED_FACTOR_INCREASE * lat_change
-    new_lon = current_lon + SPEED_FACTOR_INCREASE * lon_change
+    new_lat = current_lat + lat_change
+    new_lon = current_lon + lon_change
 
     return new_lat, new_lon
 
@@ -180,8 +244,8 @@ def get_particles_cells(particles: xr.Dataset, latitude, longitude):
     lat_index = np.searchsorted(latitude_borders[:-1], particle_lat) - 1
     lon_index = np.searchsorted(longitude_borders[:-1], particle_lon) - 1
 
-    particles["latitude_index"] = xr.DataArray(lat_index, dims=("particles",))
-    particles["longitude_index"] = xr.DataArray(lon_index, dims=("particles",))
+    particles["latitude_index"] = xr.DataArray(lat_index, dims=("particle",))
+    particles["longitude_index"] = xr.DataArray(lon_index, dims=("particle",))
 
 
 def initialize_particles(n_particles, latitude, longitude, uo, vo,):
@@ -199,9 +263,8 @@ def initialize_particles(n_particles, latitude, longitude, uo, vo,):
     cells_lon_indices = cells_lon_indices[data_mask]
 
     speed = np.sqrt(uo[data_mask]**2 + vo[data_mask]**2)
-    speed_indices = speed.ravel().cumsum()
 
-    prob_indices = np.sqrt(speed_indices + 1) - 1
+    prob_indices = np.sqrt(speed).ravel().cumsum()
     samples = RANDOM_GENERATOR.uniform(0, prob_indices[-1], size=n_particles)
 
     shift_lat = RANDOM_GENERATOR.uniform(0, 1, size=n_particles)
@@ -234,7 +297,7 @@ def _linearly_interpolate_between(p1, p2, q1, q2, t):
     return (q1 * (p2 - t) + q2 * (t - p1)) / (p2 - p1)
 
 
-def _bilinear_inteprolation(
+def _bilinear_interpolation(
         lat_min, lat_max, lon_min, lon_max, v_min_min, v_max_min,
         v_min_max, v_max_max, lat_position, lon_position):
     q1 = _linearly_interpolate_between(lat_min, lat_max, v_min_min, v_max_min, lat_position)
@@ -303,7 +366,7 @@ def evolve_particles(particles, uo, vo, lat_grid, lon_grid):
     assert np.all(active_longitude <= lon_max)
 
     def _interpolate_variable_on_particles(var_data):
-        return _bilinear_inteprolation(
+        return _bilinear_interpolation(
             lat_min=lat_min,
             lat_max=lat_max,
             lon_min=lon_min,
@@ -318,10 +381,6 @@ def evolve_particles(particles, uo, vo, lat_grid, lon_grid):
 
     uo_particles =  _interpolate_variable_on_particles(uo_enlarged)
     vo_particles = _interpolate_variable_on_particles(vo_enlarged)
-
-    particles_speed = np.sqrt(
-        uo_particles * uo_particles + vo_particles * vo_particles
-    )
 
     new_active_lat, new_active_lon = compute_new_coords(
         active_latitude,
@@ -371,11 +430,31 @@ def evolve_particles(particles, uo, vo, lat_grid, lon_grid):
     return new_particles, uo_at_particles, vo_at_particles
 
 
-def download_data():
-    if LOCAL_PATH.exists():
-        return
+def _replace_string(template_string: str, domain: Domain, date: np.datetime64):
+    replace_vals = {
+        "${DOMAIN}": domain.name.upper(),
+        "${DATE}": date.astype("datetime64[us]").item().strftime('%Y%m%d'),
+        "${FREQUENCY}": "hourly"
+    }
+    for old, new in replace_vals.items():
+        template_string = template_string.replace(old, new)
+    return template_string
 
-    ds = xr.open_zarr(URL, chunks={})
+def _get_local_path(domain: Domain, date: np.datetime64):
+    return Path(
+        _replace_string(template_string=LOCAL_PATH, domain=domain, date=date)
+    )
+
+def _get_url(domain: Domain, date: np.datetime64):
+    return _replace_string(template_string=URL, domain=domain, date=date)
+
+
+def download_data(domain: Domain, date: np.datetime64):
+    local_path = _get_local_path(domain, date)
+
+    download_url = _get_url(domain, date)
+
+    ds = xr.open_zarr(download_url, chunks={})
 
     ds = ds.squeeze("time", drop=True)
     ds = ds.swap_dims({"step": "valid_time"})
@@ -383,38 +462,112 @@ def download_data():
     ds = ds.rename({"valid_time": "time"})
 
     ds = ds.isel(depth=0)
-    vars_to_keep = ["thetao", "uo", "vo"]
+    vars_to_keep = ["thetao", "uo", "vo", "so"]
     vars_to_drop = [d for d in ds.data_vars if d not in vars_to_keep]
     ds = ds.drop_vars(vars_to_drop)
-    print(ds)
 
-    ds.to_zarr(LOCAL_PATH, mode="w")
-
-
-def main__ld():
-    download_data()
-
-    ds = xr.open_zarr(LOCAL_PATH, chunks={})
-
-    ds = resample_ds_in_time(ds, TIME_INTERVAL)
-
-    from matplotlib import pyplot as plt
-    for i in range(100):
-        positions = initialize_particles(
-            BATCH_SIZE,
-            ds.latitude.values,
-            ds.longitude.values,
-            ds.uo.isel(time=0).values,
-            ds.vo.isel(time=0).values
-        )
-        lats = positions["latitude"]
-        lons = positions["longitude"]
-        plt.scatter(lons, lats, s=1, marker='.', linewidths=0)
-        plt.savefig(f"/dev/shm/particles_{i:0>4}.png")
-        plt.close()
+    ds.to_zarr(local_path, mode="w")
 
 
-def run_batch(batch_index: int, batch_start_time: np.datetime64) -> None:
+def download_dem():
+    if DEM_LOCAL_PATH.exists():
+        return
+
+    import requests
+
+    DEM_LOCAL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    response = requests.get(DEM_URL)
+    response.raise_for_status()
+    DEM_LOCAL_PATH.write_bytes(response.content)
+
+
+def _load_dem_elevation(extent: tuple[float, float, float, float]):
+    """
+    Download (if needed) the DEM tile and clip it to the given
+    (lon_min, lon_max, lat_min, lat_max) extent.
+
+    Returns (elevation, lon, lat, dx, dy): the elevation grid, its
+    coordinates, and its pixel spacing in metres (dx, dy) - accounting for
+    the longitude convergence at this latitude - for use with
+    matplotlib.colors.LightSource.
+    """
+    import rioxarray
+
+    download_dem()
+
+    lon_min, lon_max, lat_min, lat_max = extent
+    dem = rioxarray.open_rasterio(DEM_LOCAL_PATH).squeeze("band", drop=True)
+    dem = dem.rio.clip_box(minx=lon_min, miny=lat_min, maxx=lon_max, maxy=lat_max)
+
+    elevation = dem.values.astype(float)
+    lon = dem.x.values
+    lat = dem.y.values
+
+    meters_per_degree_lat = 111_320.0
+    meters_per_degree_lon = meters_per_degree_lat * np.cos(np.radians(lat.mean()))
+    dx = abs(float(lon[1] - lon[0])) * meters_per_degree_lon
+    dy = abs(float(lat[1] - lat[0])) * meters_per_degree_lat
+
+    return elevation, lon, lat, dx, dy
+
+
+def compute_hillshade(extent: tuple[float, float, float, float]):
+    """
+    Compute a grayscale hillshade of the land for the given
+    (lon_min, lon_max, lat_min, lat_max) extent.
+
+    Returns (hillshade, lon, lat, cmap) - hillshade has shape
+    (len(lat), len(lon)) with values in [0, 1], to be drawn with cmap
+    "gray".
+    """
+    from matplotlib.colors import LightSource
+
+    elevation, lon, lat, dx, dy = _load_dem_elevation(extent)
+
+    light_source = LightSource(
+        azdeg=PLOT_HILLSHADE_AZIMUTH, altdeg=PLOT_HILLSHADE_ALTITUDE
+    )
+    hillshade = light_source.hillshade(elevation, dx=dx, dy=dy)
+
+    return hillshade, lon, lat, "gray"
+
+
+def compute_colored_hillshade(extent: tuple[float, float, float, float]):
+    """
+    Compute a hypsometric-tint hillshade of the land (elevation-based
+    color, shaded by relief) for the given
+    (lon_min, lon_max, lat_min, lat_max) extent.
+
+    Returns (image, lon, lat, cmap) - image is an (len(lat), len(lon), 4)
+    RGBA array already colored, so cmap is None (nothing left to map).
+    """
+    from matplotlib import colormaps
+    from matplotlib.colors import LightSource, LinearSegmentedColormap
+
+    elevation, lon, lat, dx, dy = _load_dem_elevation(extent)
+
+    # matplotlib's "terrain" colormap goes ocean-blue -> green -> brown ->
+    # white; since our DEM only covers land (elevation stays close to sea
+    # level at worst), only its land portion is used, to avoid tinting low
+    # ground blue as if it were water.
+    terrain = colormaps["terrain"]
+    land_cmap = LinearSegmentedColormap.from_list(
+        "land_terrain", terrain(np.linspace(0.25, 1.0, 256))
+    )
+
+    light_source = LightSource(
+        azdeg=PLOT_HILLSHADE_AZIMUTH, altdeg=PLOT_HILLSHADE_ALTITUDE
+    )
+    image = light_source.shade(
+        elevation, cmap=land_cmap, blend_mode="soft",
+        vmin=0, vert_exag=1, dx=dx, dy=dy,
+    )
+
+    return image, lon, lat, None
+
+
+
+def run_batch(batch_index: int, batch_start_time: np.datetime64, output_dir: Path) -> None:
     """
     Spawn a batch of particles at `batch_start_time` and evolve them for
     BATCH_TIME_LENGTH, saving the result to
@@ -427,6 +580,9 @@ def run_batch(batch_index: int, batch_start_time: np.datetime64) -> None:
     """
     global RANDOM_GENERATOR
     RANDOM_GENERATOR = np.random.default_rng(batch_index)
+
+    if _DS is None:
+        raise Exception("Dataset has not been initialized")
 
     ds = _DS
     time_values = ds.time.values
@@ -490,15 +646,27 @@ def run_batch(batch_index: int, batch_start_time: np.datetime64) -> None:
             "particle": np.arange(BATCH_SIZE),
         },
     )
-    output.to_netcdf(OUTPUT_DIR / f"particles_{batch_index}.nc")
+    output.to_netcdf(output_dir / f"particles_{batch_index}.nc")
 
 
-def compute_particles():
+def _run_batch_star(args: tuple[int, np.datetime64, Path]) -> None:
+    run_batch(*args)
+
+
+def compute_particles(domain: Domain, date: np.datetime64, output_dir: Path, show_progress: bool = True):
     global _DS
+    global VISUAL_SPEEDUP_FACTOR
 
-    download_data()
+    if domain.resolution == "regional":
+        VISUAL_SPEEDUP_FACTOR = REGIONAL_SPEEDUP_FACTOR
+    elif domain.resolution == "vhr":
+        VISUAL_SPEEDUP_FACTOR = VHR_SPEEDUP_FACTOR
+    else:
+        error_msg = f"Unknown resolution: {domain.resolution}"
+        raise ValueError(error_msg)
 
-    ds = xr.open_zarr(LOCAL_PATH, chunks={})
+    local_path = _get_local_path(domain, date)
+    ds = xr.open_zarr(local_path, chunks={})
 
     ds = resample_ds_in_time(ds, TIME_INTERVAL)
     ds = extend_ds_in_time(ds, BATCH_TIME_LENGTH)
@@ -507,7 +675,7 @@ def compute_particles():
     # instead of every worker independently re-computing the same dask graph.
     _DS = ds.compute()
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     time_values = _DS.time.values
     batch_start_times = []
@@ -516,15 +684,33 @@ def compute_particles():
         batch_start_times.append(current_time)
         current_time += BATCH_EVERY
 
-    with mp.get_context("fork").Pool() as pool:
-        pool.starmap(run_batch, enumerate(batch_start_times))
+    batches = []
+    for batch_index, batch_start_time in enumerate(batch_start_times):
+        batches.append((batch_index, batch_start_time, output_dir))
+
+    with mp.get_context("fork").Pool() as pool, tqdm(
+        total=len(batches), desc="Computing batches", disable=not show_progress
+    ) as pbar:
+        for _ in pool.imap_unordered(_run_batch_star, batches):
+            pbar.update(1)
+
+    current_simulation = Simulation(
+        domain=domain,
+        date=date.astype("datetime64[us]").item()
+    )
+    simulation_json = current_simulation.model_dump_json(indent=4)
+    simulation_file = output_dir / "simulation.json"
+    simulation_file.write_text(simulation_json, encoding="utf-8")
 
 
-def plot_frame(index: int, current_time: np.datetime64) -> None:
+def plot_frame(index: int, current_time: np.datetime64, title: str) -> None:
     """
     Plot the particles (inside_domain only) at `current_time`, gathering
     them from every batch in `_PARTICLE_DATASETS` that covers that time,
     and save the result to PLOT_OUTPUT_DIR / f"plot{index}.png".
+
+    `title` is the fully resolved plot title for this frame, computed by
+    the caller.
 
     Runs in a worker process forked from plot_particles():
     `_PARTICLE_DATASETS` is inherited from the parent rather than passed as
@@ -544,6 +730,9 @@ def plot_frame(index: int, current_time: np.datetime64) -> None:
     alphas = []
     trail_segments = []
     trail_colors = []
+
+    if _PARTICLE_DATASETS is None:
+        raise Exception("Datasets with particles have not been initialized")
 
     for particles in _PARTICLE_DATASETS:
         file_times = particles.time.values
@@ -640,18 +829,13 @@ def plot_frame(index: int, current_time: np.datetime64) -> None:
     longitudes = np.concatenate(longitudes) if longitudes else np.empty(0)
     alphas = np.concatenate(alphas) if alphas else np.empty(0)
 
-    rounded_time = (
-        (current_time + np.timedelta64(30, "m"))
-        .astype("datetime64[h]")
-        .astype("datetime64[s]")
-        .astype(object)
-    )
-
     ds_time_values = _PLOT_DS.time.values
     ds_time_index = int(np.searchsorted(ds_time_values, current_time))
-    uo = _PLOT_DS.uo.isel(time=ds_time_index).values
-    vo = _PLOT_DS.vo.isel(time=ds_time_index).values
-    speed = np.sqrt(uo * uo + vo * vo)
+
+    plot_ds = _PLOT_DS.copy(deep=False)
+    uo = plot_ds.uo
+    vo = plot_ds.vo
+    plot_ds["speed"] = np.sqrt(uo * uo + vo * vo)
 
     lat_borders, _ = get_borders_and_sizes(_PLOT_DS.latitude.values)
     lon_borders, _ = get_borders_and_sizes(_PLOT_DS.longitude.values)
@@ -660,20 +844,54 @@ def plot_frame(index: int, current_time: np.datetime64) -> None:
         figsize=(PLOT_WIDTH_PX / PLOT_DPI, PLOT_HEIGHT_PX / PLOT_DPI),
         dpi=PLOT_DPI,
     )
-    ax = plt.axes(projection=ccrs.PlateCarree())
+    if PLOT_PROJECTION == "LambertConformal":
+        projection = ccrs.LambertConformal(
+            central_longitude=(_PLOT_EXTENT[0] + _PLOT_EXTENT[1]) / 2,
+            central_latitude=(_PLOT_EXTENT[2] + _PLOT_EXTENT[3]) / 2,
+        )
+    elif PLOT_PROJECTION == "NearsidePerspective":
+        projection = ccrs.NearsidePerspective(
+            central_longitude=(_PLOT_EXTENT[0] + _PLOT_EXTENT[1]) / 2,
+            central_latitude=(_PLOT_EXTENT[2] + _PLOT_EXTENT[3]) / 2,
+            satellite_height=PLOT_NEARSIDE_SATELLITE_HEIGHT,
+        )
+    else:
+        projection = getattr(ccrs, PLOT_PROJECTION)()
+    ax = plt.axes(projection=projection)
     ax.set_extent(_PLOT_EXTENT, crs=ccrs.PlateCarree())
+    if _PLOT_HILLSHADE is not None:
+        hillshade_image, hillshade_lon, hillshade_lat, hillshade_cmap = _PLOT_HILLSHADE
+        origin = "upper" if hillshade_lat[0] > hillshade_lat[-1] else "lower"
+        ax.imshow(
+            hillshade_image, cmap=hillshade_cmap,
+            vmin=0 if hillshade_cmap else None,
+            vmax=1 if hillshade_cmap else None,
+            origin=origin,
+            extent=(
+                hillshade_lon.min(), hillshade_lon.max(),
+                hillshade_lat.min(), hillshade_lat.max(),
+            ),
+            transform=ccrs.PlateCarree(), zorder=PLOT_HILLSHADE_ZORDER,
+        )
+
+    data = plot_ds["speed"].isel(time=ds_time_index).values
     mesh = ax.pcolormesh(
-        lon_borders, lat_borders, speed,
-        cmap="plasma", vmin=0, vmax=_PLOT_SPEED_VMAX,
+        lon_borders, lat_borders, data,
+        cmap=PLOT_SPEED_CMAP, vmin=0, vmax=_PLOT_SPEED_VMAX,
         transform=ccrs.PlateCarree(), zorder=0,
     )
     colorbar = plt.colorbar(mesh, ax=ax)
     colorbar.set_label("Speed [m/s]", fontsize=PLOT_TITLE_FONTSIZE)
     colorbar.ax.tick_params(labelsize=PLOT_TITLE_FONTSIZE)
-    ax.add_feature(
-        cfeature.GSHHSFeature(scale="full", edgecolor="black", facecolor="none"),
-        zorder=1,
-    )
+    if _PLOT_COASTLINE == "GSHHFS":
+        ax.add_feature(
+            cfeature.GSHHSFeature(scale="full", edgecolor="black", facecolor="none"),
+            zorder=1,
+        )
+    elif _PLOT_COASTLINE == "cartopy10m":
+        ax.coastlines(resolution="10m", color="black", zorder=1)
+    elif _PLOT_COASTLINE == "cartopy50m":
+        ax.coastlines(resolution="50m", color="black", zorder=1)
     if trail_segments:
         trail_collection = LineCollection(
             np.concatenate(trail_segments, axis=0),
@@ -687,6 +905,7 @@ def plot_frame(index: int, current_time: np.datetime64) -> None:
         color=PLOT_PARTICLE_COLOR, alpha=alphas,
         transform=ccrs.PlateCarree(), zorder=2,
     )
+
     gridlines = ax.gridlines(
         draw_labels=True, color="lightgray", linestyle="--", zorder=1,
         xlocs=mticker.MultipleLocator(PLOT_GRIDLINE_STEP),
@@ -696,19 +915,35 @@ def plot_frame(index: int, current_time: np.datetime64) -> None:
     gridlines.right_labels = False
     gridlines.xlabel_style = {"size": PLOT_GRIDLINE_FONTSIZE}
     gridlines.ylabel_style = {"size": PLOT_GRIDLINE_FONTSIZE}
-    ax.set_title(
-        rounded_time.strftime("%Y-%m-%d %H:%M"), fontsize=PLOT_TITLE_FONTSIZE
-    )
+    ax.set_title(title, fontsize=PLOT_TITLE_FONTSIZE)
     plt.savefig(PLOT_OUTPUT_DIR / f"plot{index:0>5}.png", dpi=PLOT_DPI)
     plt.close()
 
 
-def plot_particles():
-    global _PARTICLE_DATASETS, _PLOT_EXTENT, _PLOT_DS, _PLOT_SPEED_VMAX
+def _plot_frame_star(args: tuple[int, np.datetime64, str]) -> None:
+    return plot_frame(*args)
 
-    download_data()
 
-    ds = xr.open_zarr(LOCAL_PATH, chunks={})
+def plot_particles(
+        input_dir: Path,
+        land_filler: str = "none",
+        coastline: str = "GSHHFS",
+        show_progress: bool = True,
+):
+    global _PARTICLE_DATASETS, _PLOT_EXTENT, _PLOT_DS, _PLOT_SPEED_VMAX, _PLOT_HILLSHADE, _PLOT_COASTLINE
+    global PLOT_GRIDLINE_STEP
+
+    _PLOT_COASTLINE = coastline
+
+    simulation_file = input_dir / "simulation.json"
+    simulation = Simulation.model_validate_json(simulation_file.read_text())
+
+    domain = simulation.domain
+    date = np.datetime64(simulation.date, 's')
+
+    local_path = _get_local_path(domain=domain, date=date)
+
+    ds = xr.open_zarr(local_path, chunks={})
     ds = resample_ds_in_time(ds, TIME_INTERVAL)
     # Kept lazy (dask-backed) and shared as-is with the forked workers: the
     # dataset can be hundreds of GB, so each worker reads only the time
@@ -722,36 +957,142 @@ def plot_particles():
         float(ds.latitude.min()), float(ds.latitude.max()),
     )
 
+    if domain.resolution == "regional":
+        PLOT_GRIDLINE_STEP = REGIONAL_PLOT_GRIDLINE_STEP
+    elif domain.resolution == "vhr":
+        PLOT_GRIDLINE_STEP = VHR_PLOT_GRIDLINE_STEP
+    else:
+        error_msg = f"Unknown domain resolution: {domain.resolution}"
+        raise ValueError(error_msg)
+
+    if land_filler == "hillshade":
+        _PLOT_HILLSHADE = compute_hillshade(_PLOT_EXTENT)
+    elif land_filler == "colored-hillshade":
+        _PLOT_HILLSHADE = compute_colored_hillshade(_PLOT_EXTENT)
+
     # Computed lazily through xarray/dask (a chunked reduction), so this
     # never materializes the full velocity field in memory at once.
     speed_max = np.sqrt(ds.uo ** 2 + ds.vo ** 2).max()
-    # _PLOT_SPEED_VMAX = math.ceil(float(speed_max.compute()) / 2) * 2
-    _PLOT_SPEED_VMAX = 1.
+    if _PLOT_SPEED_VMAX is None:
+        _PLOT_SPEED_VMAX = math.ceil(float(speed_max.compute()) * 10) / 10.
 
     # Loaded eagerly (and the files closed) here in the parent process, so
     # that forked workers each get plain in-memory datasets via
     # copy-on-write instead of sharing lazily-opened file handles.
     particle_datasets = []
-    for f in OUTPUT_DIR.glob("particles_*.nc"):
+    for f in input_dir.glob("particles_*.nc"):
         with xr.open_dataset(f) as particles:
             particle_datasets.append(particles.load())
     _PARTICLE_DATASETS = particle_datasets
 
     PLOT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    with mp.get_context("fork").Pool() as pool:
-        pool.starmap(plot_frame, enumerate(time_values))
+    title_template = _replace_string(TITLE, domain=domain, date=date)
+    frames = []
+    for i, t in enumerate(time_values):
+        rounded_time = (
+            (t + np.timedelta64(30, "m"))
+            .astype("datetime64[h]")
+            .astype("datetime64[s]")
+            .astype(object)
+        )
+        title = title_template.replace("${TIME}", rounded_time.strftime("%Y-%m-%d %H:%M"))
+        frames.append((i, t, title))
+    with mp.get_context("fork").Pool() as pool, tqdm(
+        total=len(frames), desc="Plotting frames", disable=not show_progress
+    ) as pbar:
+        for _ in pool.imap_unordered(_plot_frame_star, frames):
+            pbar.update(1)
+
+def _parse_date_arg(value: str) -> np.datetime64:
+    """Parse a "YYYY-MM-DD" CLI argument into an np.datetime64[s]."""
+    return np.datetime64(value, "s")
 
 
 def main():
     parser = argparse.ArgumentParser(prog="comertine")
-    parser.add_argument("action", choices=["compute", "plot"])
+    subparsers = parser.add_subparsers(dest="action", required=True)
+
+    progress_parent = argparse.ArgumentParser(add_help=False)
+    progress_parent.add_argument(
+        "--progress", action=argparse.BooleanOptionalAction, default=True,
+        help="Show a progress bar (default: enabled).",
+    )
+
+    download_parser = subparsers.add_parser("download")
+    download_parser.add_argument(
+        "-d", "--domain", choices=tuple(DOMAINS.keys()), required=True
+    )
+    download_parser.add_argument(
+        "-t", "--date", type=_parse_date_arg, required=False, default=None,
+        help="Date to compute, as YYYY-MM-DD (default: today).",
+    )
+
+    compute_parser = subparsers.add_parser("compute", parents=[progress_parent])
+    compute_parser.add_argument(
+        "-d", "--domain", choices=tuple(DOMAINS.keys()), required=True
+    )
+    compute_parser.add_argument(
+        "-t", "--date", type=_parse_date_arg, required=False, default=None,
+        help="Date to compute, as YYYY-MM-DD (default: today).",
+    )
+    compute_parser.add_argument(
+        "-o", "--output-dir", type=str, required=True,
+        help="The directory where the trajectories of the particles will be "
+             "stored. If a flag like ${DOMAIN} or ${DATE} is inside the path, "
+             "it will be replaced with the correct value",
+    )
+
+    plot_parser = subparsers.add_parser("plot", parents=[progress_parent])
+    plot_parser.add_argument(
+        "--land-filler", choices=["none", "hillshade", "colored-hillshade"],
+        default="none",
+    )
+    plot_parser.add_argument(
+        "--coastline", choices=["none", "GSHHFS", "cartopy10m", "cartopy50m"],
+        default="GSHHFS",
+    )
+    plot_parser.add_argument(
+        "-i", "--input-dir", type=Path, required=True,
+        help="The directory where the trajectories of the particles are "
+             "stored.",
+    )
+
     args = parser.parse_args()
 
-    if args.action == "compute":
-        compute_particles()
+    if args.action == "download":
+        domain = DOMAINS.get(args.domain)
+        simulation_date = args.date
+        if simulation_date is None:
+            simulation_date = np.datetime64("today", "s")
+        download_data(domain=domain, date=simulation_date)
+    elif args.action == "compute":
+        domain = DOMAINS.get(args.domain)
+        simulation_date = args.date
+        if simulation_date is None:
+            simulation_date = np.datetime64("today", "s")
+        output_dir = Path(
+            _replace_string(
+                args.output_dir,
+                domain=domain,
+                date=simulation_date
+            )
+        )
+        compute_particles(
+            domain=domain,
+            date=simulation_date,
+            output_dir=output_dir,
+            show_progress=args.progress
+        )
+    elif args.action == "plot":
+        plot_particles(
+            input_dir=args.input_dir,
+            land_filler=args.land_filler, coastline=args.coastline,
+            show_progress=args.progress,
+        )
     else:
-        plot_particles()
+        error_msg = f"Invalid action: {args.action}"
+        raise ValueError(error_msg)
 
 
 if __name__ == "__main__":

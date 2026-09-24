@@ -73,7 +73,7 @@ def resample_ds_in_time(ds, new_time_resolution: np.timedelta64):
         ]
 
         frames = []
-        for i, time_frame in enumerate(new_times):
+        for time_frame in new_times:
             interpolated_frame = sum(
                 slicing_db[s[0]] * s[1] for s in time_frame.associations
             )
