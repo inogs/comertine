@@ -10,9 +10,13 @@ from comertine.time_resample import extend_ds_in_time, resample_ds_in_time
 from comertine.domains import Domain
 from comertine.domains import DOMAINS
 from comertine.domains import Simulation
+from comertine.tools.cli import read_cli_args
+
 
 URL = "https://mer-model-bgc.ogs.it/output/${DOMAIN}/${DATE}-MER-MITgcmBFM-${DOMAIN}-fc-${FREQUENCY}-v01.zarr"
 LOCAL_PATH = "/dev/shm/${DOMAIN}-${DATE}.zarr"
+# LOCAL_PATH = "/leonardo_scratch/large/userexternal/spiani00/plots_comertine/${DOMAIN}-${DATE}.zarr"
+
 
 TITLE = "${DOMAIN} - ${VARNAME} - ${TIME}"
 
@@ -80,13 +84,13 @@ PLOT_BACKGROUND_LABELS = {
 # lon/lat (ccrs.PlateCarree()) regardless of this setting.
 # PLOT_PROJECTION = "PlateCarree"
 # PLOT_PROJECTION = "Mercator"
-PLOT_PROJECTION = "LambertConformal"
-# PLOT_PROJECTION = "NearsidePerspective"
+# PLOT_PROJECTION = "LambertConformal"
+PLOT_PROJECTION = "NearsidePerspective"
 
 # Satellite altitude (in meters) used when PLOT_PROJECTION is
 # "NearsidePerspective". Lower than the cartopy default (geostationary,
 # ~35.8e6 m) so the globe's curvature actually reads on a small domain.
-PLOT_NEARSIDE_SATELLITE_HEIGHT = 2_000_000
+PLOT_NEARSIDE_SATELLITE_HEIGHT = 1_000_000
 
 # Number of past positions (current one included) shown as a trail behind
 # each particle. Truncated near the start of a particle's own batch file,
@@ -1067,7 +1071,8 @@ def plot_particles(
     output_dir_path.mkdir(parents=True, exist_ok=True)
 
     varname = _get_background_variable_name(ds, _PLOT_BACKGROUND_VARIABLE)
-    title_template = _replace_string(TITLE, domain=domain, date=date)
+    title_template = TITLE.replace("${DOMAIN}", domain.long_name)
+    title_template = _replace_string(title_template, domain=domain, date=date)
     title_template = title_template.replace("${VARNAME}", varname)
     frames = []
     for i, t in enumerate(time_values):
@@ -1085,90 +1090,11 @@ def plot_particles(
         for _ in pool.imap_unordered(_plot_frame_star, frames):
             pbar.update(1)
 
-def _parse_date_arg(value: str) -> np.datetime64:
-    """Parse a "YYYY-MM-DD" CLI argument into an np.datetime64[s]."""
-    return np.datetime64(value, "s")
+
 
 
 def main():
-    parser = argparse.ArgumentParser(prog="comertine")
-    subparsers = parser.add_subparsers(dest="action", required=True)
-
-    progress_parent = argparse.ArgumentParser(add_help=False)
-    progress_parent.add_argument(
-        "--progress", action=argparse.BooleanOptionalAction, default=True,
-        help="Show a progress bar (default: enabled).",
-    )
-
-    download_parser = subparsers.add_parser("download")
-    download_parser.add_argument(
-        "-d", "--domain", choices=tuple(DOMAINS.keys()), required=True
-    )
-    download_parser.add_argument(
-        "-t", "--date", type=_parse_date_arg, required=False, default=None,
-        help="Date to compute, as YYYY-MM-DD (default: today).",
-    )
-
-    compute_parser = subparsers.add_parser("compute", parents=[progress_parent])
-    compute_parser.add_argument(
-        "-d", "--domain", choices=tuple(DOMAINS.keys()), required=True
-    )
-    compute_parser.add_argument(
-        "-t", "--date", type=_parse_date_arg, required=False, default=None,
-        help="Date to compute, as YYYY-MM-DD (default: today).",
-    )
-    compute_parser.add_argument(
-        "-o", "--output-dir", type=str, required=True,
-        help="The directory where the trajectories of the particles will be "
-             "stored. If a flag like ${DOMAIN} or ${DATE} is inside the path, "
-             "it will be replaced with the correct value",
-    )
-
-    plot_parser = subparsers.add_parser("plot", parents=[progress_parent])
-    plot_parser.add_argument(
-        "--land-filler", choices=["none", "hillshade", "colored-hillshade"],
-        default="none",
-    )
-    plot_parser.add_argument(
-        "--coastline", choices=["none", "GSHHFS", "cartopy10m", "cartopy50m"],
-        default="GSHHFS",
-    )
-    plot_parser.add_argument(
-        "--background-variable", choices=["speed", "thetao", "so"],
-        default="speed",
-        help="Which field to draw as the background color field: current "
-             "speed (default), temperature (thetao) or salinity (so).",
-    )
-    plot_parser.add_argument(
-        "--background-cmap", type=str, default="viridis",
-        help="Colormap used to draw the background field: a matplotlib "
-             "colormap name (default: viridis), or a cmocean colormap "
-             "name prefixed with 'cmo:' (e.g. cmo:thermal).",
-    )
-    plot_parser.add_argument(
-        "--vmin", type=float, default=None,
-        help="Lower bound of the background field's colorbar (default: "
-             "the dataset's 5th percentile of that field's values).",
-    )
-    plot_parser.add_argument(
-        "--vmax", type=float, default=None,
-        help="Upper bound of the background field's colorbar (default: "
-             "the dataset's 95th percentile of that field's values).",
-    )
-    plot_parser.add_argument(
-        "-i", "--input-dir", type=Path, required=True,
-        help="The directory where the trajectories of the particles are "
-             "stored.",
-    )
-    plot_parser.add_argument(
-        "-o", "--output-dir", type=str, default="/dev/shm/particles_plot",
-        help="The directory where the frame PNGs will be stored (default: "
-             "/dev/shm/particles_plot). If a flag like ${DOMAIN} or "
-             "${DATE} is inside the path, it will be replaced with the "
-             "correct value.",
-    )
-
-    args = parser.parse_args()
+    args = read_cli_args(DOMAINS.keys())
 
     if args.action == "download":
         domain = DOMAINS.get(args.domain)
