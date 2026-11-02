@@ -1,5 +1,5 @@
-import argparse
 import multiprocessing as mp
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -61,10 +61,39 @@ PLOT_WIDTH_PX = 3840
 PLOT_HEIGHT_PX = 2160
 PLOT_DPI = 100
 
+# Margins (in pixels) around the map used when --tight-layout is enabled:
+# the figure keeps PLOT_HEIGHT_PX as its height, the map fills the space
+# left by the top/bottom margins and the figure width is recomputed from
+# the map's aspect ratio, plus room for the latitude labels on the left and
+# for the colorbar (with its tick labels and label) on the right.
+PLOT_TIGHT_MARGIN_LEFT_PX = 130
+PLOT_TIGHT_MARGIN_RIGHT_PX = 220
+PLOT_TIGHT_MARGIN_TOP_PX = 90
+PLOT_TIGHT_MARGIN_BOTTOM_PX = 70
+PLOT_TIGHT_COLORBAR_PAD_PX = 50
+PLOT_TIGHT_COLORBAR_WIDTH_PX = 60
+# The recomputed figure width is rounded up to a multiple of this value.
+PLOT_TIGHT_WIDTH_MULTIPLE = 8
+
 PLOT_TITLE_FONTSIZE = 28
 PLOT_PARTICLE_SIZE = 15
 PLOT_PARTICLE_COLOR = "white"
 PLOT_PARTICLE_ALPHA = 0.8
+
+# Color of the coastline, in the default style and with --dark-mode.
+PLOT_COASTLINE_COLOR = "black"
+PLOT_COASTLINE_COLOR_DARK = "white"
+
+# Logo drawn inside the map axes, in the bottom right corner. The path is
+# relative to the current working directory; if the file does not exist,
+# no logo is drawn. The logo is scaled (keeping its aspect ratio) to fit a
+# box PLOT_LOGO_SIZE times the size of the map axes, placed
+# PLOT_LOGO_PADDING (in axes coordinates) away from the bottom and right
+# borders, so it never sticks out of the axes.
+PLOT_LOGO_PATH = Path("../logo.png")
+PLOT_LOGO_SIZE = 1 / 6
+PLOT_LOGO_PADDING = 0.01
+PLOT_LOGO_ZORDER = 3
 
 REGIONAL_PLOT_GRIDLINE_STEP = 0.5
 VHR_PLOT_GRIDLINE_STEP = 0.1
@@ -83,14 +112,14 @@ PLOT_BACKGROUND_LABELS = {
 # in plot_frame, where cartopy is imported). Data coordinates stay in plain
 # lon/lat (ccrs.PlateCarree()) regardless of this setting.
 # PLOT_PROJECTION = "PlateCarree"
-# PLOT_PROJECTION = "Mercator"
+PLOT_PROJECTION = "Mercator"
 # PLOT_PROJECTION = "LambertConformal"
-PLOT_PROJECTION = "NearsidePerspective"
+# PLOT_PROJECTION = "NearsidePerspective"
 
 # Satellite altitude (in meters) used when PLOT_PROJECTION is
 # "NearsidePerspective". Lower than the cartopy default (geostationary,
 # ~35.8e6 m) so the globe's curvature actually reads on a small domain.
-PLOT_NEARSIDE_SATELLITE_HEIGHT = 1_000_000
+PLOT_NEARSIDE_SATELLITE_HEIGHT = 500_000
 
 # Number of past positions (current one included) shown as a trail behind
 # each particle. Truncated near the start of a particle's own batch file,
@@ -161,6 +190,25 @@ _PLOT_COASTLINE: str = "GSHHFS"
 # plot_particles() before the multiprocessing pool is spawned so that
 # fork-ed children inherit it.
 PLOT_BACKGROUND_CMAP: str = "viridis"
+
+# Figure geometry used when --tight-layout is enabled, as
+# (figure_width_px, map_axes_rect, colorbar_axes_rect), where the rects are
+# (left, bottom, width, height) in figure coordinates; None otherwise (the
+# default PLOT_WIDTH_PX x PLOT_HEIGHT_PX canvas is used). Set in
+# plot_particles() before the multiprocessing pool is spawned so that
+# fork-ed children inherit it.
+_PLOT_TIGHT_LAYOUT: tuple[int, tuple[float, float, float, float], tuple[float, float, float, float]] | None = None
+
+# Whether to draw the frames with matplotlib's "dark_background" style. Set
+# in plot_particles() before the multiprocessing pool is spawned so that
+# fork-ed children inherit it.
+_PLOT_DARK_MODE: bool = False
+
+# The logo image (as returned by matplotlib.image.imread) drawn in the
+# bottom right corner of the map axes, or None if PLOT_LOGO_PATH does not exist.
+# Loaded in plot_particles() before the multiprocessing pool is spawned so
+# that fork-ed children inherit it.
+_PLOT_LOGO: np.typing.NDArray | None = None
 
 
 def get_borders_and_sizes(v: np.typing.NDArray):
@@ -772,6 +820,80 @@ def _resolve_colormap(name: str):
     return colormaps[name]
 
 
+def _make_projection(extent: tuple[float, float, float, float]):
+    """
+    Build the cartopy projection (selected by PLOT_PROJECTION) used to draw
+    the map axes, centered on `extent` (lon_min, lon_max, lat_min, lat_max)
+    when the projection supports it.
+    """
+    import cartopy.crs as ccrs
+
+    if PLOT_PROJECTION == "LambertConformal":
+        return ccrs.LambertConformal(
+            central_longitude=(extent[0] + extent[1]) / 2,
+            central_latitude=(extent[2] + extent[3]) / 2,
+        )
+    if PLOT_PROJECTION == "NearsidePerspective":
+        return ccrs.NearsidePerspective(
+            central_longitude=(extent[0] + extent[1]) / 2,
+            central_latitude=(extent[2] + extent[3]) / 2,
+            satellite_height=PLOT_NEARSIDE_SATELLITE_HEIGHT,
+        )
+    return getattr(ccrs, PLOT_PROJECTION)()
+
+
+def _compute_tight_layout(
+        extent: tuple[float, float, float, float]
+) -> tuple[int, tuple[float, float, float, float], tuple[float, float, float, float]]:
+    """
+    Compute the figure geometry used by --tight-layout: the figure keeps
+    PLOT_HEIGHT_PX as its height and its width is derived from the aspect
+    ratio of the map (in projected coordinates) once `extent` is set, plus
+    the PLOT_TIGHT_* margins.
+
+    Returns (figure_width_px, map_axes_rect, colorbar_axes_rect), with the
+    rects as (left, bottom, width, height) in figure coordinates.
+    """
+    import cartopy.crs as ccrs
+    # A bare Figure (not pyplot) so that no GUI backend gets initialized in
+    # the parent process before the workers are forked.
+    from matplotlib.figure import Figure
+
+    fig = Figure()
+    ax = fig.add_axes((0, 0, 1, 1), projection=_make_projection(extent))
+    ax.set_extent(extent, crs=ccrs.PlateCarree())
+    x_min, x_max = ax.get_xlim()
+    y_min, y_max = ax.get_ylim()
+    aspect_ratio = (x_max - x_min) / (y_max - y_min)
+
+    map_height_px = PLOT_HEIGHT_PX - PLOT_TIGHT_MARGIN_TOP_PX - PLOT_TIGHT_MARGIN_BOTTOM_PX
+    map_width_px = map_height_px * aspect_ratio
+    figure_width_px = (
+        PLOT_TIGHT_MARGIN_LEFT_PX + map_width_px + PLOT_TIGHT_COLORBAR_PAD_PX
+        + PLOT_TIGHT_COLORBAR_WIDTH_PX + PLOT_TIGHT_MARGIN_RIGHT_PX
+    )
+    # Rounded up to a multiple of PLOT_TIGHT_WIDTH_MULTIPLE pixels, so that
+    # the frames are friendly to video encoders (chroma subsampling and
+    # macroblocks) when turning them into a movie.
+    figure_width_px = int(
+        np.ceil(figure_width_px / PLOT_TIGHT_WIDTH_MULTIPLE) * PLOT_TIGHT_WIDTH_MULTIPLE
+    )
+
+    map_rect = (
+        PLOT_TIGHT_MARGIN_LEFT_PX / figure_width_px,
+        PLOT_TIGHT_MARGIN_BOTTOM_PX / PLOT_HEIGHT_PX,
+        map_width_px / figure_width_px,
+        map_height_px / PLOT_HEIGHT_PX,
+    )
+    colorbar_rect = (
+        (PLOT_TIGHT_MARGIN_LEFT_PX + map_width_px + PLOT_TIGHT_COLORBAR_PAD_PX) / figure_width_px,
+        PLOT_TIGHT_MARGIN_BOTTOM_PX / PLOT_HEIGHT_PX,
+        PLOT_TIGHT_COLORBAR_WIDTH_PX / figure_width_px,
+        map_height_px / PLOT_HEIGHT_PX,
+    )
+    return figure_width_px, map_rect, colorbar_rect
+
+
 def plot_frame(index: int, current_time: np.datetime64, title: str, output_dir: Path) -> None:
     """
     Plot the particles (inside_domain only) at `current_time`, gathering
@@ -907,24 +1029,22 @@ def plot_frame(index: int, current_time: np.datetime64, title: str, output_dir: 
     lat_borders, _ = get_borders_and_sizes(_PLOT_DS.latitude.values)
     lon_borders, _ = get_borders_and_sizes(_PLOT_DS.longitude.values)
 
-    plt.figure(
-        figsize=(PLOT_WIDTH_PX / PLOT_DPI, PLOT_HEIGHT_PX / PLOT_DPI),
+    if _PLOT_DARK_MODE:
+        plt.style.use("dark_background")
+
+    if _PLOT_TIGHT_LAYOUT is not None:
+        figure_width_px, map_rect, colorbar_rect = _PLOT_TIGHT_LAYOUT
+    else:
+        figure_width_px, map_rect, colorbar_rect = PLOT_WIDTH_PX, None, None
+    fig = plt.figure(
+        figsize=(figure_width_px / PLOT_DPI, PLOT_HEIGHT_PX / PLOT_DPI),
         dpi=PLOT_DPI,
     )
-    if PLOT_PROJECTION == "LambertConformal":
-        projection = ccrs.LambertConformal(
-            central_longitude=(_PLOT_EXTENT[0] + _PLOT_EXTENT[1]) / 2,
-            central_latitude=(_PLOT_EXTENT[2] + _PLOT_EXTENT[3]) / 2,
-        )
-    elif PLOT_PROJECTION == "NearsidePerspective":
-        projection = ccrs.NearsidePerspective(
-            central_longitude=(_PLOT_EXTENT[0] + _PLOT_EXTENT[1]) / 2,
-            central_latitude=(_PLOT_EXTENT[2] + _PLOT_EXTENT[3]) / 2,
-            satellite_height=PLOT_NEARSIDE_SATELLITE_HEIGHT,
-        )
+    projection = _make_projection(_PLOT_EXTENT)
+    if map_rect is not None:
+        ax = fig.add_axes(map_rect, projection=projection)
     else:
-        projection = getattr(ccrs, PLOT_PROJECTION)()
-    ax = plt.axes(projection=projection)
+        ax = plt.axes(projection=projection)
     ax.set_extent(_PLOT_EXTENT, crs=ccrs.PlateCarree())
     if _PLOT_HILLSHADE is not None:
         hillshade_image, hillshade_lon, hillshade_lat, hillshade_cmap = _PLOT_HILLSHADE
@@ -948,18 +1068,22 @@ def plot_frame(index: int, current_time: np.datetime64, title: str, output_dir: 
         cmap=background_cmap, vmin=_PLOT_SPEED_VMIN, vmax=_PLOT_SPEED_VMAX,
         transform=ccrs.PlateCarree(), zorder=0,
     )
-    colorbar = plt.colorbar(mesh, ax=ax)
+    if colorbar_rect is not None:
+        colorbar = plt.colorbar(mesh, cax=fig.add_axes(colorbar_rect))
+    else:
+        colorbar = plt.colorbar(mesh, ax=ax)
     colorbar.set_label(PLOT_BACKGROUND_LABELS[_PLOT_BACKGROUND_VARIABLE], fontsize=PLOT_TITLE_FONTSIZE)
     colorbar.ax.tick_params(labelsize=PLOT_TITLE_FONTSIZE)
+    coastline_color = PLOT_COASTLINE_COLOR_DARK if _PLOT_DARK_MODE else PLOT_COASTLINE_COLOR
     if _PLOT_COASTLINE == "GSHHFS":
         ax.add_feature(
-            cfeature.GSHHSFeature(scale="full", edgecolor="black", facecolor="none"),
+            cfeature.GSHHSFeature(scale="full", edgecolor=coastline_color, facecolor="none"),
             zorder=1,
         )
     elif _PLOT_COASTLINE == "cartopy10m":
-        ax.coastlines(resolution="10m", color="black", zorder=1)
+        ax.coastlines(resolution="10m", color=coastline_color, zorder=1)
     elif _PLOT_COASTLINE == "cartopy50m":
-        ax.coastlines(resolution="50m", color="black", zorder=1)
+        ax.coastlines(resolution="50m", color=coastline_color, zorder=1)
     if trail_segments:
         trail_collection = LineCollection(
             np.concatenate(trail_segments, axis=0),
@@ -983,6 +1107,21 @@ def plot_frame(index: int, current_time: np.datetime64, title: str, output_dir: 
     gridlines.right_labels = False
     gridlines.xlabel_style = {"size": PLOT_GRIDLINE_FONTSIZE}
     gridlines.ylabel_style = {"size": PLOT_GRIDLINE_FONTSIZE}
+    if _PLOT_LOGO is not None:
+        logo_ax = ax.inset_axes(
+            (
+                1 - PLOT_LOGO_PADDING - PLOT_LOGO_SIZE,
+                PLOT_LOGO_PADDING,
+                PLOT_LOGO_SIZE,
+                PLOT_LOGO_SIZE,
+            ),
+            zorder=PLOT_LOGO_ZORDER,
+        )
+        logo_ax.imshow(_PLOT_LOGO)
+        # The image keeps its aspect ratio, so it shrinks inside the box
+        # along one direction: keep it glued to the bottom right corner.
+        logo_ax.set_anchor("SE")
+        logo_ax.set_axis_off()
     ax.set_title(title, fontsize=PLOT_TITLE_FONTSIZE)
     plt.savefig(output_dir / f"plot{index:0>5}.png", dpi=PLOT_DPI)
     plt.close()
@@ -1001,9 +1140,12 @@ def plot_particles(
         background_cmap: str = "viridis",
         vmin: float | None = None,
         vmax: float | None = None,
+        tight_layout: bool = False,
+        dark_mode: bool = False,
         show_progress: bool = True,
 ):
     global _PARTICLE_DATASETS, _PLOT_EXTENT, _PLOT_DS, _PLOT_BACKGROUND_VARIABLE, _PLOT_SPEED_VMIN, _PLOT_SPEED_VMAX, _PLOT_HILLSHADE, _PLOT_COASTLINE
+    global _PLOT_TIGHT_LAYOUT, _PLOT_DARK_MODE, _PLOT_LOGO
     global PLOT_GRIDLINE_STEP, PLOT_BACKGROUND_CMAP
 
     _PLOT_COASTLINE = coastline
@@ -1011,6 +1153,13 @@ def plot_particles(
     PLOT_BACKGROUND_CMAP = background_cmap
     _PLOT_SPEED_VMIN = vmin
     _PLOT_SPEED_VMAX = vmax
+    _PLOT_DARK_MODE = dark_mode
+
+    if PLOT_LOGO_PATH.exists():
+        import matplotlib.image as mpimg
+        _PLOT_LOGO = mpimg.imread(PLOT_LOGO_PATH)
+    else:
+        warnings.warn(f"Logo file {PLOT_LOGO_PATH} not found: no logo will be drawn")
 
     simulation_file = input_dir / "simulation.json"
     simulation = Simulation.model_validate_json(simulation_file.read_text())
@@ -1035,6 +1184,9 @@ def plot_particles(
         float(ds.longitude.min()), float(ds.longitude.max()),
         float(ds.latitude.min()), float(ds.latitude.max()),
     )
+
+    if tight_layout:
+        _PLOT_TIGHT_LAYOUT = _compute_tight_layout(_PLOT_EXTENT)
 
     if domain.resolution == "regional":
         PLOT_GRIDLINE_STEP = REGIONAL_PLOT_GRIDLINE_STEP
@@ -1128,6 +1280,7 @@ def main():
             background_variable=args.background_variable,
             background_cmap=args.background_cmap,
             vmin=args.vmin, vmax=args.vmax,
+            tight_layout=args.tight_layout, dark_mode=args.dark_mode,
             show_progress=args.progress,
         )
     else:

@@ -86,6 +86,17 @@ def read_cli_args(domain_names: Iterable[str]):
              "the dataset's 95th percentile of that field's values).",
     )
     plot_parser.add_argument(
+        "--tight-layout", action="store_true", default=False,
+        help="Recompute the width of the frames from the aspect ratio of "
+             "the map, so that the image is only slightly wider than the "
+             "map itself (leaving room for the axis labels and the "
+             "colorbar) instead of using a fixed 16:9 canvas.",
+    )
+    plot_parser.add_argument(
+        "--dark-mode", action="store_true", default=False,
+        help="Draw the frames using matplotlib's 'dark_background' style.",
+    )
+    plot_parser.add_argument(
         "-i", "--input-dir", type=Path, required=True,
         help="The directory where the trajectories of the particles are "
              "stored.",
