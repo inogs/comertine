@@ -1,4 +1,3 @@
-from datetime import datetime
 from types import MappingProxyType
 from typing import Literal
 
@@ -25,8 +24,3 @@ HGT = Domain(name="HGT", long_name="Gulf of Trieste", resolution="vhr")
 DOMAINS = MappingProxyType(
     {d.name: d for d in [NAD, SAD, ION, TYR, LIG, SAR, SIC, HGT]}
 )
-
-
-class Simulation(BaseModel):
-    domain: Domain
-    date: datetime
