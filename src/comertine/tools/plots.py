@@ -5,7 +5,13 @@ from matplotlib import colormaps
 from comertine.tools.geometry import Extent
 
 
-def _resolve_colormap(name: str):
+# Satellite altitude (in meters) used by the "NearsidePerspective"
+# projection. Lower than the cartopy default (geostationary, ~35.8e6 m) so
+# the globe's curvature actually reads on a small domain.
+PLOT_NEARSIDE_SATELLITE_HEIGHT = 500_000
+
+
+def resolve_colormap(name: str):
     """
     Resolve a --background-cmap string into an actual matplotlib Colormap.
 
@@ -19,11 +25,11 @@ def _resolve_colormap(name: str):
     return colormaps[name]
 
 
-def _make_projection(projection_name: str, extent: Extent):
+def make_projection(projection_name: str, extent: Extent):
     """
-    Build the cartopy projection (selected by PLOT_PROJECTION) used to draw
-    the map axes, centered on `extent` (lon_min, lon_max, lat_min, lat_max)
-    when the projection supports it.
+    Build the cartopy projection named `projection_name` (the name of a
+    cartopy.crs class) used to draw the map axes, centered on `extent` when
+    the projection supports it.
     """
     if projection_name == "LambertConformal":
         return ccrs.LambertConformal(

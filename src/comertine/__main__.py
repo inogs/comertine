@@ -6,32 +6,34 @@ import numpy as np
 import xarray as xr
 from distributed import Client
 from distributed import LocalCluster
+from tqdm import tqdm
 
 from comertine.algorithms.lagrangian_simulation import LagrangianSimulation
 from comertine.algorithms.lagrangian_simulation import compute_particles
 from comertine.tools.file_names import concretize_template_string
+from comertine.tools.file_names import get_data_file_path
+from comertine.tools.geometry import Extent
+from comertine.tools.geometry import get_borders_and_sizes
 from comertine.tools.time_resample import resample_ds_in_time
 from comertine.domains import DOMAINS
+from comertine.domains import Domain
 from comertine.tools.cli import read_cli_args
 from comertine.tools.downloader import download_data
 from comertine.tools.particle_config import ParticleConfig
 from comertine.tools.particle_config import auto_speed_factor
+from comertine.tools.plots import make_projection
+from comertine.tools.plots import resolve_colormap
+from comertine.tools.static_data import check_static_data
+from comertine.tools.static_data import configure_cartopy
+from comertine.tools.static_data import download_static_data
+from comertine.tools.static_data import get_dem_product
+from comertine.tools.static_data import get_dem_tile_paths
 
 
 TITLE = "${DOMAIN} - ${VARNAME} - ${TIME}"
 
 
 RANDOM_GENERATOR = np.random.default_rng(0)
-
-# Copernicus DEM GLO-30 tile covering the whole ocean model domain (a
-# single 1x1 degree tile is enough, since the domain is tiny). Public,
-# no-auth AWS Open Data bucket.
-DEM_URL = (
-    "https://copernicus-dem-30m.s3.amazonaws.com/"
-    "Copernicus_DSM_COG_10_N45_00_E013_00_DEM/"
-    "Copernicus_DSM_COG_10_N45_00_E013_00_DEM.tif"
-)
-DEM_LOCAL_PATH = Path("/scratch/spiani/dem_n45_e013.tif")
 
 PLOT_HILLSHADE_AZIMUTH = 315
 PLOT_HILLSHADE_ALTITUDE = 45
@@ -89,18 +91,13 @@ PLOT_BACKGROUND_LABELS = {
     "so": "Salinity [PSU]",
 }
 
-# Name of the cartopy.crs class used to draw the map axes (resolved lazily
-# in plot_frame, where cartopy is imported). Data coordinates stay in plain
+# Name of the cartopy.crs class used to draw the map axes (see
+# comertine.tools.plots.make_projection). Data coordinates stay in plain
 # lon/lat (ccrs.PlateCarree()) regardless of this setting.
 # PLOT_PROJECTION = "PlateCarree"
 PLOT_PROJECTION = "Mercator"
 # PLOT_PROJECTION = "LambertConformal"
 # PLOT_PROJECTION = "NearsidePerspective"
-
-# Satellite altitude (in meters) used when PLOT_PROJECTION is
-# "NearsidePerspective". Lower than the cartopy default (geostationary,
-# ~35.8e6 m) so the globe's curvature actually reads on a small domain.
-PLOT_NEARSIDE_SATELLITE_HEIGHT = 500_000
 
 # Number of past positions (current one included) shown as a trail behind
 # each particle. Truncated near the start of a particle's own batch file,
@@ -163,7 +160,7 @@ _PLOT_COASTLINE: str = "GSHHFS"
 # Name of the colormap used to draw the background field, as a plain
 # matplotlib colormap name (e.g. "viridis") or, prefixed with "cmo:", the
 # name of a cmocean colormap (e.g. "cmo:thermal"). Turned into an actual
-# Colormap object by _resolve_colormap() in each plot worker. Set in
+# Colormap object by resolve_colormap() in each plot worker. Set in
 # plot_particles() before the multiprocessing pool is spawned so that
 # fork-ed children inherit it.
 PLOT_BACKGROUND_CMAP: str = "viridis"
@@ -189,35 +186,68 @@ _PLOT_LOGO: np.typing.NDArray | None = None
 
 
 
-def download_dem():
-    if DEM_LOCAL_PATH.exists():
-        return
-
-    import requests
-
-    DEM_LOCAL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    response = requests.get(DEM_URL)
-    response.raise_for_status()
-    DEM_LOCAL_PATH.write_bytes(response.content)
-
-
-def _load_dem_elevation(extent: tuple[float, float, float, float]):
+def _load_dem_elevation(extent: tuple[float, float, float, float], tile_paths: list[Path]):
     """
-    Download (if needed) the DEM tile and clip it to the given
-    (lon_min, lon_max, lat_min, lat_max) extent.
+    Read the DEM tiles stored in tile_paths, clip them to the given
+    (lon_min, lon_max, lat_min, lat_max) extent and merge them into a
+    single grid. The areas not covered by any tile (the tiles that would
+    only contain sea do not exist) are filled with 0, i.e. sea level.
 
     Returns (elevation, lon, lat, dx, dy): the elevation grid, its
     coordinates, and its pixel spacing in metres (dx, dy) - accounting for
     the longitude convergence at this latitude - for use with
-    matplotlib.colors.LightSource.
+    matplotlib.colors.LightSource - or None if no tile intersects the
+    extent.
     """
     import rioxarray
-
-    download_dem()
+    from rioxarray.exceptions import NoDataInBounds
+    from rioxarray.merge import merge_arrays
 
     lon_min, lon_max, lat_min, lat_max = extent
-    dem = rioxarray.open_rasterio(DEM_LOCAL_PATH).squeeze("band", drop=True)
-    dem = dem.rio.clip_box(minx=lon_min, miny=lat_min, maxx=lon_max, maxy=lat_max)
+    pieces = []
+    for tile_path in tile_paths:
+        tile = rioxarray.open_rasterio(tile_path).squeeze("band", drop=True)
+        try:
+            pieces.append(
+                tile.rio.clip_box(minx=lon_min, miny=lat_min, maxx=lon_max, maxy=lat_max)
+            )
+        except NoDataInBounds:
+            continue
+    if not pieces:
+        return None
+
+    # Downsample the DEM (averaging the pixels) so that it is not larger
+    # than the frame: the map always fits inside PLOT_WIDTH_PX x
+    # PLOT_HEIGHT_PX keeping its aspect ratio, so scaling the DEM by
+    # min(W / nx, H / ny) still leaves at least one DEM pixel for each
+    # pixel of the map. Without this, the hillshade of a regional domain at
+    # 90 m is wider than the whole 4K frame and needs several GB of memory.
+    # Each tile is downsampled on its own, before merging them, so that the
+    # full resolution grid of the whole domain is never built.
+    res_x, res_y = (abs(r) for r in pieces[0].rio.resolution())
+    full_nx = (lon_max - lon_min) / res_x
+    full_ny = (lat_max - lat_min) / res_y
+    scale = min(PLOT_WIDTH_PX / full_nx, PLOT_HEIGHT_PX / full_ny)
+    if scale < 1:
+        from rasterio.enums import Resampling
+
+        res_x, res_y = res_x / scale, res_y / scale
+        pieces = [
+            # No nodata value: the sea (0) must be averaged with the land,
+            # not skipped
+            piece.rio.write_nodata(None).rio.reproject(
+                piece.rio.crs, resolution=(res_x, res_y),
+                resampling=Resampling.average,
+            )
+            for piece in pieces
+        ]
+
+    # Merged on a single grid covering the whole extent: the areas not
+    # covered by any tile are filled with 0 (sea level)
+    dem = merge_arrays(
+        pieces, bounds=(lon_min, lat_min, lon_max, lat_max),
+        res=(res_x, res_y), nodata=0,
+    )
 
     elevation = dem.values.astype(float)
     lon = dem.x.values
@@ -231,7 +261,7 @@ def _load_dem_elevation(extent: tuple[float, float, float, float]):
     return elevation, lon, lat, dx, dy
 
 
-def compute_hillshade(extent: tuple[float, float, float, float]):
+def compute_hillshade(extent: tuple[float, float, float, float], tile_paths: list[Path]):
     """
     Compute a grayscale hillshade of the land for the given
     (lon_min, lon_max, lat_min, lat_max) extent.
@@ -242,7 +272,10 @@ def compute_hillshade(extent: tuple[float, float, float, float]):
     """
     from matplotlib.colors import LightSource
 
-    elevation, lon, lat, dx, dy = _load_dem_elevation(extent)
+    dem = _load_dem_elevation(extent, tile_paths)
+    if dem is None:
+        return None
+    elevation, lon, lat, dx, dy = dem
 
     light_source = LightSource(
         azdeg=PLOT_HILLSHADE_AZIMUTH, altdeg=PLOT_HILLSHADE_ALTITUDE
@@ -252,7 +285,7 @@ def compute_hillshade(extent: tuple[float, float, float, float]):
     return hillshade, lon, lat, "gray"
 
 
-def compute_colored_hillshade(extent: tuple[float, float, float, float]):
+def compute_colored_hillshade(extent: tuple[float, float, float, float], tile_paths: list[Path]):
     """
     Compute a hypsometric-tint hillshade of the land (elevation-based
     color, shaded by relief) for the given
@@ -264,7 +297,10 @@ def compute_colored_hillshade(extent: tuple[float, float, float, float]):
     from matplotlib import colormaps
     from matplotlib.colors import LightSource, LinearSegmentedColormap
 
-    elevation, lon, lat, dx, dy = _load_dem_elevation(extent)
+    dem = _load_dem_elevation(extent, tile_paths)
+    if dem is None:
+        return None
+    elevation, lon, lat, dx, dy = dem
 
     # matplotlib's "terrain" colormap goes ocean-blue -> green -> brown ->
     # white; since our DEM only covers land (elevation stays close to sea
@@ -339,7 +375,7 @@ def _compute_tight_layout(
     from matplotlib.figure import Figure
 
     fig = Figure()
-    ax = fig.add_axes((0, 0, 1, 1), projection=_make_projection(extent))
+    ax = fig.add_axes((0, 0, 1, 1), projection=make_projection(PLOT_PROJECTION, Extent(*extent)))
     ax.set_extent(extent, crs=ccrs.PlateCarree())
     x_min, x_max = ax.get_xlim()
     y_min, y_max = ax.get_ylim()
@@ -519,7 +555,7 @@ def plot_frame(index: int, current_time: np.datetime64, title: str, output_dir: 
         figsize=(figure_width_px / PLOT_DPI, PLOT_HEIGHT_PX / PLOT_DPI),
         dpi=PLOT_DPI,
     )
-    projection = _make_projection(_PLOT_EXTENT)
+    projection = make_projection(PLOT_PROJECTION, Extent(*_PLOT_EXTENT))
     if map_rect is not None:
         ax = fig.add_axes(map_rect, projection=projection)
     else:
@@ -541,7 +577,7 @@ def plot_frame(index: int, current_time: np.datetime64, title: str, output_dir: 
         )
 
     data = background_field.isel(time=ds_time_index).values
-    background_cmap = _resolve_colormap(PLOT_BACKGROUND_CMAP)
+    background_cmap = resolve_colormap(PLOT_BACKGROUND_CMAP)
     mesh = ax.pcolormesh(
         lon_borders, lat_borders, data,
         cmap=background_cmap, vmin=_PLOT_SPEED_VMIN, vmax=_PLOT_SPEED_VMAX,
@@ -610,9 +646,69 @@ def _plot_frame_star(args: tuple[int, np.datetime64, str, Path]) -> None:
     return plot_frame(*args)
 
 
+def _init_plot_worker() -> None:
+    """
+    Initializer of the plot worker processes. The parent process may have
+    already used dask's threaded scheduler (e.g. to compute the bounds of
+    the colorbar): its thread pool is inherited by the forked workers, but
+    without its threads, so any computation submitted to it would wait
+    forever. Each worker reads only one time slice per frame, so it simply
+    runs its dask computations in its own thread.
+    """
+    import dask
+
+    dask.config.set(scheduler="synchronous")
+
+
+def _preload_coastline(coastline: str) -> None:
+    """
+    Read the coastline geometries once in the parent process: cartopy caches
+    them, and the forked workers inherit the cache. Otherwise each worker
+    would read the whole (global) shapefile again for its first frame,
+    which takes about a minute for the full resolution GSHHS one.
+    """
+    import cartopy.feature as cfeature
+
+    if coastline == "GSHHFS":
+        # Same feature (scale and levels) drawn by plot_frame
+        feature = cfeature.GSHHSFeature(scale="full")
+    elif coastline == "cartopy10m":
+        feature = cfeature.NaturalEarthFeature("physical", "coastline", "10m")
+    elif coastline == "cartopy50m":
+        feature = cfeature.NaturalEarthFeature("physical", "coastline", "50m")
+    else:
+        return
+    for _ in feature.geometries():
+        pass
+
+
+def _open_background_dataset(
+        local_directory: Path, domain: Domain, date: np.datetime64, variable: str
+) -> xr.Dataset:
+    """
+    Lazily open the data of the model (as stored by the download action)
+    needed to draw the given background variable: the velocities for
+    "speed", or the file of the variable itself otherwise.
+    """
+    file_variable = "velocities" if variable == "speed" else variable
+    path = get_data_file_path(
+        file_variable, local_directory, domain=domain, date=date,
+        create_parents=False,
+    )
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Data of the model not found: {path}. Run `comertine download "
+            f"-d {domain.name} -t {np.datetime_as_string(date, unit='D')} "
+            f"-l {local_directory}` first."
+        )
+    return xr.open_zarr(path, chunks={})
+
+
 def plot_particles(
         input_dir: Path,
-        output_dir: str = "/dev/shm/particles_plot",
+        local_path: Path,
+        output_dir: str,
+        static_dir: Path | None = None,
         land_filler: str = "none",
         coastline: str = "GSHHFS",
         background_variable: str = "speed",
@@ -646,12 +742,29 @@ def plot_particles(
     domain = simulation.domain
     date = np.datetime64(simulation.date, 's')
 
-    output_dir_path = Path(_replace_string(output_dir, domain=domain, date=date))
+    need_dem = land_filler != "none"
+    if need_dem or coastline != "none":
+        if static_dir is None:
+            raise ValueError(
+                "A static data directory is required to draw the land "
+                "filler or the coastline"
+            )
+        # Fails early (before reading any model data) if something is
+        # missing, instead of letting cartopy try to download it.
+        # configure_cartopy is called here, in the parent process, so that
+        # the forked workers inherit cartopy's data_dir.
+        check_static_data(
+            static_dir, domain=domain, need_dem=need_dem, coastline=coastline
+        )
+        configure_cartopy(static_dir)
+        _preload_coastline(coastline)
 
-    local_path = _get_local_path(domain=domain, date=date)
+    output_dir_path = Path(concretize_template_string(output_dir, domain=domain, date=date))
 
-    ds = xr.open_zarr(local_path, chunks={})
-    ds = resample_ds_in_time(ds, TIME_INTERVAL)
+    ds = _open_background_dataset(local_path, domain, date, background_variable)
+    # Resampled on the time step of the simulation, so that each frame
+    # matches a time at which the positions of the particles are saved
+    ds = resample_ds_in_time(ds, simulation.config.time_interval)
     # Kept lazy (dask-backed) and shared as-is with the forked workers: the
     # dataset can be hundreds of GB, so each worker reads only the time
     # slice it needs from disk instead of the whole thing being loaded into
@@ -675,10 +788,16 @@ def plot_particles(
         error_msg = f"Unknown domain resolution: {domain.resolution}"
         raise ValueError(error_msg)
 
-    if land_filler == "hillshade":
-        _PLOT_HILLSHADE = compute_hillshade(_PLOT_EXTENT)
-    elif land_filler == "colored-hillshade":
-        _PLOT_HILLSHADE = compute_colored_hillshade(_PLOT_EXTENT)
+    if need_dem:
+        dem_tile_paths = get_dem_tile_paths(
+            static_dir, get_dem_product(domain), _PLOT_EXTENT
+        )
+        if land_filler == "hillshade":
+            _PLOT_HILLSHADE = compute_hillshade(_PLOT_EXTENT, dem_tile_paths)
+        elif land_filler == "colored-hillshade":
+            _PLOT_HILLSHADE = compute_colored_hillshade(_PLOT_EXTENT, dem_tile_paths)
+        if _PLOT_HILLSHADE is None:
+            warnings.warn(f"No land in domain {domain.name}: no hillshade will be drawn")
 
     if _PLOT_SPEED_VMIN is None or _PLOT_SPEED_VMAX is None:
         # Computed lazily through xarray/dask (a chunked reduction), so this
@@ -703,7 +822,7 @@ def plot_particles(
 
     varname = _get_background_variable_name(ds, _PLOT_BACKGROUND_VARIABLE)
     title_template = TITLE.replace("${DOMAIN}", domain.long_name)
-    title_template = _replace_string(title_template, domain=domain, date=date)
+    title_template = concretize_template_string(title_template, domain=domain, date=date)
     title_template = title_template.replace("${VARNAME}", varname)
     frames = []
     for i, t in enumerate(time_values):
@@ -715,7 +834,7 @@ def plot_particles(
         )
         title = title_template.replace("${TIME}", rounded_time.strftime("%Y-%m-%d %H:%M"))
         frames.append((i, t, title, output_dir_path))
-    with mp.get_context("fork").Pool() as pool, tqdm(
+    with mp.get_context("fork").Pool(initializer=_init_plot_worker) as pool, tqdm(
         total=len(frames), desc="Plotting frames", disable=not show_progress
     ) as pbar:
         for _ in pool.imap_unordered(_plot_frame_star, frames):
@@ -732,6 +851,15 @@ def main():
         if simulation_date is None:
             simulation_date = np.datetime64("today", "s")
         download_data(domain=domain, date=simulation_date, local_directory=args.local_path, variables=["thetao", "so", "uo", "vo"])
+    elif args.action == "download-static":
+        if args.domain is None:
+            domains = list(DOMAINS.values())
+        else:
+            domains = [DOMAINS[d] for d in args.domain]
+        download_static_data(
+            static_dir=args.local_path, domains=domains,
+            show_progress=args.progress,
+        )
     elif args.action == "compute":
         domain = DOMAINS.get(args.domain)
         simulation_date = args.date
@@ -783,7 +911,9 @@ def main():
     elif args.action == "plot":
         plot_particles(
             input_dir=args.input_dir,
+            local_path=args.local_path,
             output_dir=args.output_dir,
+            static_dir=args.static_dir,
             land_filler=args.land_filler, coastline=args.coastline,
             background_variable=args.background_variable,
             background_cmap=args.background_cmap,

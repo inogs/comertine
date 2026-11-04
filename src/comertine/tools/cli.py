@@ -83,6 +83,23 @@ def read_cli_args(domain_names: Iterable[str]):
              "stored.",
     )
 
+    download_static_parser = subparsers.add_parser(
+        "download-static", parents=[progress_parent],
+        help="Download the static data (land elevation and coastlines) "
+             "needed by the plot. Run it on a machine with internet access.",
+    )
+    download_static_parser.add_argument(
+        "-d", "--domain", choices=domain_names, nargs="+", default=None,
+        help="Domains whose land elevation will be downloaded (default: "
+             "all of them).",
+    )
+    download_static_parser.add_argument(
+        "-l", "--local-path", type=Path, required=True,
+        help="Path to the local directory where the static data will be "
+             "stored (created if it does not exist). Pass the same "
+             "directory to the --static-dir option of the plot action.",
+    )
+
     compute_parser = subparsers.add_parser("compute", parents=[progress_parent])
     compute_parser.add_argument(
         "-d", "--domain", choices=domain_names, required=True
@@ -194,6 +211,18 @@ def read_cli_args(domain_names: Iterable[str]):
         help="Draw the frames using matplotlib's 'dark_background' style.",
     )
     plot_parser.add_argument(
+        "-l", "--local-path", type=_parse_existing_dir, required=True,
+        help="Path to the local directory where the data of the model is "
+             "stored (the same one passed to the download and compute "
+             "actions).",
+    )
+    plot_parser.add_argument(
+        "-s", "--static-dir", type=_parse_existing_dir, default=None,
+        help="The directory where the static data has been stored by the "
+             "download-static action. Required unless both --land-filler "
+             "and --coastline are 'none'.",
+    )
+    plot_parser.add_argument(
         "-i", "--input-dir", type=Path, required=True,
         help="The directory where the trajectories of the particles are "
              "stored.",
@@ -207,4 +236,13 @@ def read_cli_args(domain_names: Iterable[str]):
     )
 
     args = parser.parse_args()
+
+    if args.action == "plot" and args.static_dir is None and (
+        args.land_filler != "none" or args.coastline != "none"
+    ):
+        parser.error(
+            "--static-dir is required unless both --land-filler and "
+            "--coastline are 'none'"
+        )
+
     return args
