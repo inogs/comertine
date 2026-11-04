@@ -850,7 +850,10 @@ def main():
         simulation_date = args.date
         if simulation_date is None:
             simulation_date = np.datetime64("today", "s")
-        download_data(domain=domain, date=simulation_date, local_directory=args.local_path, variables=["thetao", "so", "uo", "vo"])
+        download_data(
+            domain=domain, date=simulation_date,
+            local_directory=args.local_path, variables=args.variables,
+        )
     elif args.action == "download-static":
         if args.domain is None:
             domains = list(DOMAINS.values())

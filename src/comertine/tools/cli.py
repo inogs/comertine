@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
+from comertine.tools.downloader import AVAILABLE_VARIABLES
 from comertine.tools.time_conversions import parse_timedelta
 
 def _parse_date_arg(value: str) -> np.datetime64:
@@ -91,6 +92,13 @@ def read_cli_args(domain_names: Iterable[str]):
         "-l", "--local-path", type=_parse_existing_dir, required=True,
         help="Path to the local directory where the data of the model will be "
              "stored.",
+    )
+    download_parser.add_argument(
+        "-v", "--variables", nargs="+", choices=AVAILABLE_VARIABLES,
+        default=None, metavar="VARIABLE",
+        help="The variables to download, among: "
+             f"{', '.join(AVAILABLE_VARIABLES)} (default: all of them). uo "
+             "and vo are always downloaded, even if they are not listed.",
     )
 
     download_static_parser = subparsers.add_parser(
