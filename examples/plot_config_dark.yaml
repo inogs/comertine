@@ -1,0 +1,22 @@
+# Example configuration of the plot action:
+#
+#     comertine plot -c examples/plot_config_dark.yaml -s STATIC_DIR ...
+#
+# The file has the same structure of comertine.tools.plot_config.PlotConfig.
+# Only the options that differ from the defaults are written here: every
+# omitted option (or section) keeps its default value.
+
+figure:
+  # Black background (matplotlib's "dark_background" style); the coastline
+  # is drawn with coastline.color_dark (white by default)
+  dark_mode: true
+
+tight_layout:
+  # The width of the frames is recomputed from the aspect ratio of the map,
+  # instead of using a fixed 16:9 canvas
+  enabled: true
+
+land:
+  # Grayscale hillshade of the land, below the ocean field (it needs the
+  # DEM downloaded by the download-static action)
+  filler: hillshade

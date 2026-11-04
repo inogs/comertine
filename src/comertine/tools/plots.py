@@ -3,17 +3,12 @@ import cmocean
 from matplotlib import colormaps
 
 from comertine.tools.geometry import Extent
-
-
-# Satellite altitude (in meters) used by the "NearsidePerspective"
-# projection. Lower than the cartopy default (geostationary, ~35.8e6 m) so
-# the globe's curvature actually reads on a small domain.
-PLOT_NEARSIDE_SATELLITE_HEIGHT = 500_000
+from comertine.tools.plot_config import ProjectionConfig
 
 
 def resolve_colormap(name: str):
     """
-    Resolve a --background-cmap string into an actual matplotlib Colormap.
+    Resolve the name of a colormap into an actual matplotlib Colormap.
 
     A "cmo:" prefix selects a cmocean colormap by name (e.g.
     "cmo:thermal"); otherwise `name` is looked up among matplotlib's
@@ -25,12 +20,13 @@ def resolve_colormap(name: str):
     return colormaps[name]
 
 
-def make_projection(projection_name: str, extent: Extent):
+def make_projection(config: ProjectionConfig, extent: Extent):
     """
-    Build the cartopy projection named `projection_name` (the name of a
-    cartopy.crs class) used to draw the map axes, centered on `extent` when
-    the projection supports it.
+    Build the cartopy projection described by `config` (whose name is the
+    name of a cartopy.crs class) used to draw the map axes, centered on
+    `extent` when the projection supports it.
     """
+    projection_name = config.name
     if projection_name == "LambertConformal":
         return ccrs.LambertConformal(
             central_longitude=extent.central_longitude(),
@@ -40,6 +36,6 @@ def make_projection(projection_name: str, extent: Extent):
         return ccrs.NearsidePerspective(
             central_longitude=extent.central_longitude(),
             central_latitude=extent.central_latitude(),
-            satellite_height=PLOT_NEARSIDE_SATELLITE_HEIGHT,
+            satellite_height=config.nearside_satellite_height,
         )
     return getattr(ccrs, projection_name)()

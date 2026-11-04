@@ -47,6 +47,16 @@ def _parse_speed_factor_arg(value: str) -> float | str:
     return factor
 
 
+def _parse_existing_file(value: str) -> Path:
+    """Parse a CLI argument into an existing file."""
+    path = Path(value)
+    if not path.exists():
+        raise argparse.ArgumentTypeError(f"File {path} does not exist")
+    if not path.is_file():
+        raise argparse.ArgumentTypeError(f"{path} is not a file")
+    return path
+
+
 def _parse_existing_dir(value: str) -> Path:
     """Parse a CLI argument into an existing directory."""
     path = Path(value)
@@ -170,45 +180,14 @@ def read_cli_args(domain_names: Iterable[str]):
 
     plot_parser = subparsers.add_parser("plot", parents=[progress_parent])
     plot_parser.add_argument(
-        "--land-filler", choices=["none", "hillshade", "colored-hillshade"],
-        default="none",
-    )
-    plot_parser.add_argument(
-        "--coastline", choices=["none", "GSHHFS", "cartopy10m", "cartopy50m"],
-        default="GSHHFS",
-    )
-    plot_parser.add_argument(
-        "--background-variable", choices=["speed", "thetao", "so"],
-        default="speed",
-        help="Which field to draw as the background color field: current "
-             "speed (default), temperature (thetao) or salinity (so).",
-    )
-    plot_parser.add_argument(
-        "--background-cmap", type=str, default="viridis",
-        help="Colormap used to draw the background field: a matplotlib "
-             "colormap name (default: viridis), or a cmocean colormap "
-             "name prefixed with 'cmo:' (e.g. cmo:thermal).",
-    )
-    plot_parser.add_argument(
-        "--vmin", type=float, default=None,
-        help="Lower bound of the background field's colorbar (default: "
-             "the dataset's 5th percentile of that field's values).",
-    )
-    plot_parser.add_argument(
-        "--vmax", type=float, default=None,
-        help="Upper bound of the background field's colorbar (default: "
-             "the dataset's 95th percentile of that field's values).",
-    )
-    plot_parser.add_argument(
-        "--tight-layout", action="store_true", default=False,
-        help="Recompute the width of the frames from the aspect ratio of "
-             "the map, so that the image is only slightly wider than the "
-             "map itself (leaving room for the axis labels and the "
-             "colorbar) instead of using a fixed 16:9 canvas.",
-    )
-    plot_parser.add_argument(
-        "--dark-mode", action="store_true", default=False,
-        help="Draw the frames using matplotlib's 'dark_background' style.",
+        "-c", "--config", type=_parse_existing_file, default=None,
+        help="YAML file with the configuration of the plots. It has the "
+             "same structure of comertine.tools.plot_config.PlotConfig (one "
+             "section for each of its fields: figure, tight_layout, "
+             "projection, gridlines, background, land, coastline, logo, "
+             "particles, trail); every option and every section can be "
+             "omitted, in which case its default value is used (default: "
+             "use the default value of every option).",
     )
     plot_parser.add_argument(
         "-l", "--local-path", type=_parse_existing_dir, required=True,
@@ -219,8 +198,8 @@ def read_cli_args(domain_names: Iterable[str]):
     plot_parser.add_argument(
         "-s", "--static-dir", type=_parse_existing_dir, default=None,
         help="The directory where the static data has been stored by the "
-             "download-static action. Required unless both --land-filler "
-             "and --coastline are 'none'.",
+             "download-static action. Required unless both the land filler "
+             "and the coastline are 'none' in the configuration.",
     )
     plot_parser.add_argument(
         "-i", "--input-dir", type=Path, required=True,
@@ -236,13 +215,4 @@ def read_cli_args(domain_names: Iterable[str]):
     )
 
     args = parser.parse_args()
-
-    if args.action == "plot" and args.static_dir is None and (
-        args.land_filler != "none" or args.coastline != "none"
-    ):
-        parser.error(
-            "--static-dir is required unless both --land-filler and "
-            "--coastline are 'none'"
-        )
-
     return args
