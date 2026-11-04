@@ -18,7 +18,8 @@ from comertine.tools.file_names import concretize_template_string
 from comertine.tools.file_names import get_data_file_path
 from comertine.tools.geometry import Extent
 from comertine.tools.geometry import get_borders_and_sizes
-from comertine.tools.time_resample import resample_ds_in_time
+from comertine.tools.time_resample import interpolate_at_time
+from comertine.tools.time_resample import regular_times
 from comertine.domains import DOMAINS
 from comertine.domains import Domain
 from comertine.tools.cli import read_cli_args
@@ -51,8 +52,10 @@ class _PlotContext:
     # The particle datasets, already loaded in memory
     particle_datasets: list[xr.Dataset]
 
-    # The (resampled) ocean dataset used to draw the background field. Kept
-    # lazy (dask-backed): each worker reads only the time slice it needs.
+    # The data of the model used to draw the background field, with its
+    # own time resolution (each frame interpolates between its two closest
+    # times). Kept lazy (dask-backed): each worker reads only the time
+    # slices it needs.
     ds: xr.Dataset
 
     # The map extent (lon_min, lon_max, lat_min, lat_max)
@@ -466,10 +469,12 @@ def plot_frame(index: int, current_time: np.datetime64, title: str, output_dir: 
     longitudes = np.concatenate(longitudes) if longitudes else np.empty(0)
     alphas = np.concatenate(alphas) if alphas else np.empty(0)
 
-    ds_time_values = context.ds.time.values
-    ds_time_index = int(np.searchsorted(ds_time_values, current_time))
-
-    background_field = _select_background_field(context.ds, config.background.variable)
+    # The data of the model at the time of the frame, interpolated between
+    # the two closest times of the file (whatever its time resolution)
+    background_field = _select_background_field(
+        interpolate_at_time(context.ds, current_time),
+        config.background.variable,
+    )
 
     lat_borders, _ = get_borders_and_sizes(context.ds.latitude.values)
     lon_borders, _ = get_borders_and_sizes(context.ds.longitude.values)
@@ -506,7 +511,7 @@ def plot_frame(index: int, current_time: np.datetime64, title: str, output_dir: 
             transform=ccrs.PlateCarree(), zorder=config.land.zorder,
         )
 
-    data = background_field.isel(time=ds_time_index).values
+    data = background_field.values
     background_cmap = resolve_colormap(config.background.cmap)
     mesh = ax.pcolormesh(
         lon_borders, lat_borders, data,
@@ -663,6 +668,42 @@ def _load_coastline(
     return tuple(clipped)
 
 
+def _format_frame_time(time: np.datetime64) -> str:
+    """
+    The time shown in the title of a frame: `time` rounded to the closest
+    hour (half past rounds up), as "YYYY-MM-DD HH:MM".
+
+    The frames are much closer than one hour, so showing their exact time
+    would make the title change at every frame.
+    """
+    rounded_time = (
+        (time + np.timedelta64(30, "m"))
+        .astype("datetime64[h]")
+        .astype("datetime64[s]")
+        .astype(object)
+    )
+    return rounded_time.strftime("%Y-%m-%d %H:%M")
+
+
+def _frame_times(
+        local_directory: Path, domain: Domain, date: np.datetime64,
+        time_interval: np.timedelta64,
+) -> np.ndarray:
+    """
+    The times of the frames: every `time_interval` (the time step of the
+    simulation), from the first to the last time of the velocities.
+    """
+    path = get_data_file_path(
+        "velocities", local_directory, domain=domain, date=date,
+        create_parents=False,
+    )
+    if not path.exists():
+        raise FileNotFoundError(f"Velocities of the model not found: {path}")
+    with xr.open_zarr(path, chunks={}) as velocities:
+        times = velocities.time.values
+    return regular_times(times[0], times[-1], time_interval)
+
+
 def _open_background_dataset(
         local_directory: Path, domain: Domain, date: np.datetime64, variable: str
 ) -> xr.Dataset:
@@ -745,15 +786,19 @@ def plot_particles(
 
     output_dir_path = Path(concretize_template_string(output_dir, domain=domain, date=date))
 
-    ds = _open_background_dataset(local_path, domain, date, background_variable)
-    # Resampled on the time step of the simulation, so that each frame
-    # matches a time at which the positions of the particles are saved.
     # Kept lazy (dask-backed) and shared as-is with the forked workers: the
     # dataset can be hundreds of GB, so each worker reads only the time
-    # slice it needs from disk instead of the whole thing being loaded into
-    # memory here.
-    ds = resample_ds_in_time(ds, simulation.config.time_interval)
-    time_values = ds.time.values
+    # slices it needs from disk instead of the whole thing being loaded into
+    # memory here. It is not resampled: each frame interpolates between its
+    # two closest times, so any time resolution (hourly, daily, ...) works.
+    ds = _open_background_dataset(local_path, domain, date, background_variable)
+
+    # The frames are drawn at the times at which the positions of the
+    # particles are saved, over the time range of the velocities (the data
+    # that moved the particles), independently of the background variable
+    time_values = _frame_times(
+        local_path, domain, date, simulation.config.time_interval
+    )
 
     extent = (
         float(ds.longitude.min()), float(ds.longitude.max()),
@@ -820,13 +865,7 @@ def plot_particles(
     title_template = title_template.replace("${VARNAME}", varname)
     frames = []
     for i, t in enumerate(time_values):
-        rounded_time = (
-            (t + np.timedelta64(30, "m"))
-            .astype("datetime64[h]")
-            .astype("datetime64[s]")
-            .astype(object)
-        )
-        title = title_template.replace("${TIME}", rounded_time.strftime("%Y-%m-%d %H:%M"))
+        title = title_template.replace("${TIME}", _format_frame_time(t))
         frames.append((i, t, title, output_dir_path))
     with mp.get_context("fork").Pool(
         initializer=_init_plot_worker, initargs=(context,)

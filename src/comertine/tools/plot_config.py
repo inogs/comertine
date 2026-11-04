@@ -14,7 +14,7 @@ from pydantic import model_validator
 from comertine.domains import Domain
 
 
-BackgroundVariable = Literal["speed", "thetao", "so"]
+BackgroundVariable = Literal["speed", "thetao", "so", "o2", "chl", "no3"]
 CoastlineKind = Literal["none", "GSHHFS", "cartopy10m", "cartopy50m"]
 LandFiller = Literal["none", "hillshade", "colored-hillshade"]
 ProjectionName = Literal[
@@ -132,7 +132,11 @@ class GridlinesConfig(_FrozenModel):
 
 class BackgroundConfig(_FrozenModel):
     # The field drawn as the background color field: the current speed
-    # (computed from uo/vo), the temperature (thetao) or the salinity (so)
+    # (computed from uo/vo) or one of the variables downloaded by the
+    # download action: temperature (thetao), salinity (so), dissolved
+    # oxygen (o2), chlorophyll (chl) or nitrate (no3). Their time resolution
+    # does not matter: each frame interpolates between the two closest times
+    # of the data
     variable: BackgroundVariable = "speed"
 
     # A matplotlib colormap name (e.g. "viridis") or, prefixed with "cmo:",
@@ -150,6 +154,9 @@ class BackgroundConfig(_FrozenModel):
         "speed": "Speed [m/s]",
         "thetao": "Temperature [°C]",
         "so": "Salinity [PSU]",
+        "o2": "Dissolved oxygen [mmol/m³]",
+        "chl": "Chlorophyll [mg/m³]",
+        "no3": "Nitrate [mmol/m³]",
     }
 
     @field_validator("labels", mode="before")

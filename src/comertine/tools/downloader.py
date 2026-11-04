@@ -29,6 +29,15 @@ VARIABLE_FREQUENCIES: MappingProxyType[str, Frequency] = MappingProxyType({
 
 AVAILABLE_VARIABLES = tuple(VARIABLE_FREQUENCIES)
 
+# The files of the model contain hourly (daily) means, labeled with the
+# start of their hour (day): they are moved to the middle of their
+# interval, so that interpolating in time (in the simulation and in the
+# plots) uses the time each mean refers to
+TIME_OFFSETS: MappingProxyType[Frequency, np.timedelta64] = MappingProxyType({
+    "hourly": np.timedelta64(30, "m"),
+    "daily": np.timedelta64(12, "h"),
+})
+
 # Always downloaded: they are needed to move the particles
 REQUIRED_VARIABLES = ("uo", "vo")
 
@@ -75,7 +84,10 @@ def _open_surface_dataset(
     Only `variables` are kept, the "time" (the date of the run) and "step"
     (the forecast step) dimensions are replaced by a single "time" dimension
     with the actual time of each frame, and only the first (surface) layer is
-    selected. The processing is the same for the hourly and the daily files.
+    selected. The processing is the same for the hourly and the daily files,
+    except for the offset added to their times, which moves each mean to the
+    middle of its interval (see TIME_OFFSETS): hh:30 for the hourly files,
+    12:00 for the daily ones.
     """
     ds = xr.open_zarr(_get_url(domain, date, frequency), chunks={})
 
@@ -88,6 +100,10 @@ def _open_surface_dataset(
     ds = ds.swap_dims({"step": "valid_time"})
     ds = ds.drop_vars(["step"])
     ds = ds.rename({"valid_time": "time"})
+
+    ds = ds.assign_coords(
+        time=(ds.time + TIME_OFFSETS[frequency]).assign_attrs(ds.time.attrs)
+    )
 
     return ds.isel(depth=0)
 

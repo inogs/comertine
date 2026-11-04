@@ -481,3 +481,55 @@ def resample_ds_in_time(
         max_source_frames=max_source_frames,
         allowed_outside=padding,
     )
+
+
+@overload
+def interpolate_at_time(
+    data: xr.DataArray, time: np.datetime64
+) -> xr.DataArray: ...
+
+
+@overload
+def interpolate_at_time(data: xr.Dataset, time: np.datetime64) -> xr.Dataset: ...
+
+
+def interpolate_at_time(
+    data: xr.Dataset | xr.DataArray, time: np.datetime64
+) -> xr.Dataset | xr.DataArray:
+    """
+    Linearly interpolate `data` at a single time.
+
+    Only the two frames of `data` closest to `time` (the last one before and
+    the first one after it) are used, so this works with any (even
+    irregular) time resolution of `data` and, when `data` is lazy, reads
+    only those two frames. Before the first (after the last) time of
+    `data`, its first (last) frame is returned.
+
+    Args:
+        data: The dataset or array, with a sorted "time" dimension.
+        time: The time of the result.
+
+    Returns:
+        `data` at `time`, without the "time" dimension and coordinate; the
+        interpolated values are float64.
+    """
+    times = data.time.values
+    if times.size == 0:
+        msg = "data must contain at least one time value"
+        raise ValueError(msg)
+
+    time = np.clip(time, times[0], times[-1])
+    if times.size == 1:
+        return data.isel(time=0, drop=True)
+
+    i = int(np.searchsorted(times, time, side="right")) - 1
+    i = min(max(i, 0), times.size - 2)
+
+    weight = float((time - times[i]) / (times[i + 1] - times[i]))
+    before = data.isel(time=i, drop=True)
+    if weight == 0.:
+        return before
+    after = data.isel(time=i + 1, drop=True)
+    if weight == 1.:
+        return after
+    return (1. - weight) * before.astype(np.float64) + weight * after.astype(np.float64)
